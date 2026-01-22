@@ -91,12 +91,13 @@ pub fn decode_rgba_into(
 - Transform coefficient parsing via CABAC (residual.rs)
 - Adaptive Golomb-Rice coefficient decoding
 - DC coefficient inference for coded sub-blocks
-- Sign data hiding (partial: 269/280 CTUs decode)
+- Sign data hiding (all 280 CTUs now decode)
 - Debug infrastructure (debug.rs) with CABAC tracker
+- sig_coeff_flag proper H.265 context derivation
 
 ### In Progress
-- sig_coeff_flag full context derivation (root cause of CABAC desync)
 - coded_sub_block_flag full context derivation
+- Debug remaining chroma bias (~170 avg vs expected ~128)
 
 ### Pending
 - Conformance window cropping
@@ -114,17 +115,19 @@ pub fn decode_rgba_into(
 
 ## Known Bugs
 
-### CABAC Desync (Root Cause: Simplified Context Selection)
-- **Root cause:** sig_coeff_flag and coded_sub_block_flag use simplified single-context
-  selection instead of the full H.265 neighbor-dependent context derivation
-- **Effect:** Progressive CABAC state divergence from reference decoder
-- **Symptoms:**
-  - First large coefficient (>500) appears at byte 1713 (CTU 1)
-  - 38 large coefficients detected in example.heic
-  - 269/280 CTUs decode before end_of_slice_segment detected early
-  - Chroma prediction averages drift to impossible values (e.g., 367.6)
-  - RGB output shows extreme color artifacts
-- **Fix:** Implement full context derivation per H.265 sections 9.3.4.2.3 and 9.3.4.2.5
+### CABAC Context Derivation (Partially Fixed)
+- **sig_coeff_flag:** ✅ Fixed with proper H.265 9.3.4.2.5 context derivation
+- **coded_sub_block_flag:** Still uses simplified single-context (needs fixing)
+- **Current status after sig_coeff_flag fix:**
+  - All 280 CTUs decode successfully
+  - Large coefficients reduced from 38 to 27
+  - Chroma averages stabilized (~170 vs impossible 367.6 before)
+  - RGB output no longer shows extreme artifacts
+
+### Remaining Chroma Bias
+- Chroma prediction averages ~170 instead of expected ~128
+- May be caused by remaining simplified coded_sub_block_flag context
+- Or accumulated error from early large coefficients at byte 298
 
 ### Other Issues
 - Output dimensions 1280x856 vs reference 1280x854 (missing conformance window cropping)
