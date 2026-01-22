@@ -197,16 +197,27 @@ pub fn decode_residual(
     let scan_sub = get_scan_sub_block(log2_size, scan_order);
     let scan_pos = get_scan_4x4(scan_order);
 
+    // Convert ScanOrder to scan_idx for context derivation
+    let scan_idx = match scan_order {
+        ScanOrder::Diagonal => 0,
+        ScanOrder::Horizontal => 1,
+        ScanOrder::Vertical => 2,
+    };
+
     // Find last sub-block
-    let sb_width = size / 4;
+    let sb_width = (size / 4) as usize;
     let last_sb_x = last_x / 4;
     let last_sb_y = last_y / 4;
-    let last_sb_idx = find_scan_pos(scan_sub, last_sb_x, last_sb_y, sb_width);
+    let last_sb_idx = find_scan_pos(scan_sub, last_sb_x, last_sb_y, sb_width as u32);
 
     // Find last position within sub-block
     let local_x = (last_x % 4) as u8;
     let local_y = (last_y % 4) as u8;
     let last_pos_in_sb = find_scan_pos_4x4(scan_pos, local_x, local_y);
+
+    // Track coded_sub_block_flag for prevCsbf calculation
+    // Max sub-block grid is 8x8 for 32x32 TU
+    let mut coded_sb_flags = [[false; 8]; 8];
 
     // Decode coefficients
     for sb_idx in (0..=last_sb_idx).rev() {
@@ -221,6 +232,27 @@ pub fn decode_residual(
             (coded, coded)
         } else {
             (true, false) // First and last sub-blocks don't use DC inference
+        };
+
+        // Track coded sub-block flag
+        if sb_coded {
+            coded_sb_flags[sb_y as usize][sb_x as usize] = true;
+        }
+
+        // Calculate prevCsbf from neighbor sub-blocks
+        // bit 0: right neighbor coded, bit 1: below neighbor coded
+        let prev_csbf = {
+            let right_coded = if (sb_x as usize + 1) < sb_width {
+                coded_sb_flags[sb_y as usize][sb_x as usize + 1]
+            } else {
+                false
+            };
+            let below_coded = if (sb_y as usize + 1) < sb_width {
+                coded_sb_flags[sb_y as usize + 1][sb_x as usize]
+            } else {
+                false
+            };
+            (if right_coded { 1 } else { 0 }) | (if below_coded { 2 } else { 0 })
         };
 
         if !sb_coded {
@@ -258,7 +290,10 @@ pub fn decode_residual(
         // Decode significant_coeff_flags for positions last_coeff down to 1
         // (DC at position 0 is handled separately for inference)
         for n in (1..=last_coeff).rev() {
-            let sig = decode_sig_coeff_flag(cabac, ctx, c_idx, n)?;
+            let sig = decode_sig_coeff_flag(
+                cabac, ctx, c_idx, n,
+                log2_size, scan_idx, sb_x, sb_y, prev_csbf, scan_pos
+            )?;
             if sig {
                 coeff_flags[n as usize] = true;
                 coeff_values[n as usize] = 1;
@@ -278,7 +313,10 @@ pub fn decode_residual(
                 num_coeffs += 1;
             } else {
                 // Decode sig_coeff_flag for DC
-                let sig = decode_sig_coeff_flag(cabac, ctx, c_idx, 0)?;
+                let sig = decode_sig_coeff_flag(
+                    cabac, ctx, c_idx, 0,
+                    log2_size, scan_idx, sb_x, sb_y, prev_csbf, scan_pos
+                )?;
                 if sig {
                     coeff_flags[0] = true;
                     coeff_values[0] = 1;
@@ -591,15 +629,131 @@ fn decode_coded_sub_block_flag(
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
-/// Decode significant_coeff_flag
+/// Context index map for 4x4 TU sig_coeff_flag (H.265 Table 9-41)
+/// Maps position (y*4 + x) to context index
+static CTX_IDX_MAP_4X4: [u8; 16] = [
+    0, 1, 4, 5,
+    2, 3, 4, 5,
+    6, 6, 8, 8,
+    7, 7, 8, 8,
+];
+
+/// Calculate sig_coeff_flag context index
+///
+/// Per H.265 section 9.3.4.2.5, the context depends on:
+/// - Position within sub-block (xP, yP)
+/// - Sub-block position within TU (xS, yS)
+/// - coded_sub_block_flag of neighbors (prevCsbf)
+/// - Component (luma/chroma)
+/// - TU size and scan order
+///
+/// Parameters:
+/// - x_c, y_c: coefficient position within TU
+/// - log2_size: TU size (2=4x4, 3=8x8, 4=16x16, 5=32x32)
+/// - c_idx: component (0=Y, 1=Cb, 2=Cr)
+/// - scan_idx: scan order (0=diagonal, 1=horizontal, 2=vertical)
+/// - prev_csbf: coded_sub_block_flag of neighbors (bit0=right, bit1=below)
+fn calc_sig_coeff_flag_ctx(
+    x_c: u8,
+    y_c: u8,
+    log2_size: u8,
+    c_idx: u8,
+    scan_idx: u8,
+    prev_csbf: u8,
+) -> usize {
+    let sb_width = 1u8 << (log2_size - 2);
+
+    let sig_ctx = if sb_width == 1 {
+        // 4x4 TU: use lookup table
+        CTX_IDX_MAP_4X4[(y_c as usize * 4 + x_c as usize).min(15)]
+    } else if x_c == 0 && y_c == 0 {
+        // DC coefficient
+        0
+    } else {
+        // Sub-block and position within sub-block
+        let x_s = x_c >> 2;
+        let y_s = y_c >> 2;
+        let x_p = x_c & 3;
+        let y_p = y_c & 3;
+
+        // Base context from position and neighbor flags
+        let mut ctx = match prev_csbf {
+            0 => {
+                // No coded neighbors
+                if x_p + y_p >= 3 { 0 }
+                else if x_p + y_p > 0 { 1 }
+                else { 2 }
+            }
+            1 => {
+                // Right neighbor coded
+                if y_p == 0 { 2 }
+                else if y_p == 1 { 1 }
+                else { 0 }
+            }
+            2 => {
+                // Below neighbor coded
+                if x_p == 0 { 2 }
+                else if x_p == 1 { 1 }
+                else { 0 }
+            }
+            _ => {
+                // Both neighbors coded
+                2
+            }
+        };
+
+        if c_idx == 0 {
+            // Luma
+            if x_s + y_s > 0 {
+                ctx += 3; // Not first sub-block
+            }
+
+            // Size-dependent offset
+            if sb_width == 2 {
+                // 8x8 TU
+                ctx += if scan_idx == 0 { 9 } else { 15 };
+            } else {
+                // 16x16 or 32x32 TU
+                ctx += 21;
+            }
+        } else {
+            // Chroma
+            if sb_width == 2 {
+                // 8x8 TU
+                ctx += 9;
+            } else {
+                // 16x16 or larger TU
+                ctx += 12;
+            }
+        }
+
+        ctx
+    };
+
+    // Final context index
+    context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 } + sig_ctx as usize
+}
+
+/// Decode significant_coeff_flag with proper context derivation
 fn decode_sig_coeff_flag(
     cabac: &mut CabacDecoder<'_>,
     ctx: &mut [ContextModel],
     c_idx: u8,
-    _pos: u8,
+    pos: u8,
+    log2_size: u8,
+    scan_idx: u8,
+    sb_x: u8,
+    sb_y: u8,
+    prev_csbf: u8,
+    scan_table: &[(u8, u8); 16],
 ) -> Result<bool> {
-    // Simplified: use single context
-    let ctx_idx = context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 };
+    // Get coefficient position within TU from scan position
+    let (x_in_sb, y_in_sb) = scan_table[pos as usize];
+    let x_c = sb_x * 4 + x_in_sb;
+    let y_c = sb_y * 4 + y_in_sb;
+
+    let ctx_idx = calc_sig_coeff_flag_ctx(x_c, y_c, log2_size, c_idx, scan_idx, prev_csbf);
+
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
