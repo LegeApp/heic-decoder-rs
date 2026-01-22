@@ -240,7 +240,8 @@ pub fn decode_residual(
         }
 
         // Calculate prevCsbf from neighbor sub-blocks
-        // bit 0: right neighbor coded, bit 1: below neighbor coded
+        // Per H.265: prevCsbf = (csbf[xS+1][yS] << 1) + csbf[xS][yS+1]
+        // bit 0: below neighbor coded, bit 1: right neighbor coded
         let prev_csbf = {
             let right_coded = if (sb_x as usize + 1) < sb_width {
                 coded_sb_flags[sb_y as usize][sb_x as usize + 1]
@@ -252,7 +253,7 @@ pub fn decode_residual(
             } else {
                 false
             };
-            (if right_coded { 1 } else { 0 }) | (if below_coded { 2 } else { 0 })
+            (if below_coded { 1 } else { 0 }) | (if right_coded { 2 } else { 0 })
         };
 
         if !sb_coded {
@@ -652,7 +653,7 @@ static CTX_IDX_MAP_4X4: [u8; 16] = [
 /// - log2_size: TU size (2=4x4, 3=8x8, 4=16x16, 5=32x32)
 /// - c_idx: component (0=Y, 1=Cb, 2=Cr)
 /// - scan_idx: scan order (0=diagonal, 1=horizontal, 2=vertical)
-/// - prev_csbf: coded_sub_block_flag of neighbors (bit0=right, bit1=below)
+/// - prev_csbf: coded_sub_block_flag of neighbors (bit0=below, bit1=right per H.265)
 fn calc_sig_coeff_flag_ctx(
     x_c: u8,
     y_c: u8,
@@ -677,21 +678,22 @@ fn calc_sig_coeff_flag_ctx(
         let y_p = y_c & 3;
 
         // Base context from position and neighbor flags
+        // Per H.265 9.3.4.2.5: prevCsbf bit0=below, bit1=right
         let mut ctx = match prev_csbf {
             0 => {
-                // No coded neighbors
+                // No coded neighbors: context based on position sum
                 if x_p + y_p >= 3 { 0 }
                 else if x_p + y_p > 0 { 1 }
                 else { 2 }
             }
             1 => {
-                // Right neighbor coded
+                // Below neighbor coded (bit0=1): context based on y position
                 if y_p == 0 { 2 }
                 else if y_p == 1 { 1 }
                 else { 0 }
             }
             2 => {
-                // Below neighbor coded
+                // Right neighbor coded (bit1=1): context based on x position
                 if x_p == 0 { 2 }
                 else if x_p == 1 { 1 }
                 else { 0 }
