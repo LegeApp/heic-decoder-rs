@@ -24,7 +24,15 @@ cargo test --test compare_reference write_comparison_images -- --nocapture --ign
 - libde265 (C++): `/home/lilith/work/heic/libde265-src/`
 - OpenHEVC (C): `/home/lilith/work/heic/openhevc-src/`
 
-Do NOT use web searches for HEVC spec details - read the reference implementations directly.
+## HEVC Specification
+
+**ITU-T H.265 (08/2021)** organized by decoder component:
+- `/home/lilith/work/heic/spec/sections/README.md` - Index
+- `/home/lilith/work/heic/spec/sections/09-decoding/03-slice-decoding.md` - Slice/CTU/CU decoding
+- `/home/lilith/work/heic/spec/sections/10-parsing/cabac/` - CABAC context derivation
+- Key sections for coefficient decode: 9.3.4.2.5 (sig_coeff_flag ctx), 9.3.4.2.6 (greater1_flag ctx)
+
+Do NOT use web searches for HEVC spec details - read the spec sections or reference implementations directly.
 
 ## API Design Guidelines
 
