@@ -358,8 +358,9 @@ pub fn decode_residual(
 
         // c1 tracks if any greater1_flag is 1 (for next subblock's ctxSet)
         // Reset to 1 at start of each subblock
-        // Per libde265: ctxSet = c1 directly (HM algorithm)
+        // Per libde265: ctxSet = c1, captured at subblock start and used for ALL g1 flags
         let mut c1 = 1u8;
+        let ctx_set = c1; // Capture initial c1 - this stays constant for entire subblock
 
         // greater1Ctx: context index component, reset to 1 each subblock
         // Updated BEFORE decoding each coefficient (except first) based on PREVIOUS flag
@@ -397,8 +398,8 @@ pub fn decode_residual(
                 }
             }
 
-            // Per libde265: ctxSet = c1 (HM algorithm)
-            let g1 = decode_coeff_greater1_flag(cabac, ctx, c_idx, c1, greater1_ctx)?;
+            // Use ctx_set (captured at subblock start) for ALL greater1_flags
+            let g1 = decode_coeff_greater1_flag(cabac, ctx, c_idx, ctx_set, greater1_ctx)?;
             last_greater1_flag = g1;
 
             if g1 {
@@ -417,9 +418,9 @@ pub fn decode_residual(
         }
 
         // Decode greater-2 flag (only for first coefficient with greater-1)
-        // Per libde265: uses ctxSet from last greater1 decode, which is c1
+        // Uses same ctx_set as greater1_flags (captured at subblock start)
         if let Some(g1_idx) = first_g1_idx {
-            let g2 = decode_coeff_greater2_flag(cabac, ctx, c_idx, c1)?;
+            let g2 = decode_coeff_greater2_flag(cabac, ctx, c_idx, ctx_set)?;
             if g2 {
                 coeff_values[g1_idx as usize] = 3;
                 needs_remaining[g1_idx as usize] = true;
