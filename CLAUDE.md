@@ -92,17 +92,17 @@ pub fn decode_rgba_into(
 - Adaptive Golomb-Rice coefficient decoding
 - DC coefficient inference for coded sub-blocks
 - Sign data hiding (partial: 269/280 CTUs decode)
+- Debug infrastructure (debug.rs) with CABAC tracker
 
 ### In Progress
-- Sign data hiding edge case (11 CTUs fail with sign hiding enabled)
-- Sub-block scan tables for 16x16 and 32x32 TUs
+- sig_coeff_flag full context derivation (root cause of CABAC desync)
+- coded_sub_block_flag full context derivation
 
 ### Pending
 - Conformance window cropping
 - Deblocking filter
 - SAO (Sample Adaptive Offset)
 - SIMD optimization
-- Clean up debug output
 
 ## Known Limitations
 
@@ -114,9 +114,19 @@ pub fn decode_rgba_into(
 
 ## Known Bugs
 
-- Sign data hiding causes CABAC desync at CTU 269 (11/280 CTUs fail)
-  - With sign hiding enabled: 269/280 CTUs decode successfully
-  - Without sign hiding: all 280 CTUs decode but with wrong chroma values
+### CABAC Desync (Root Cause: Simplified Context Selection)
+- **Root cause:** sig_coeff_flag and coded_sub_block_flag use simplified single-context
+  selection instead of the full H.265 neighbor-dependent context derivation
+- **Effect:** Progressive CABAC state divergence from reference decoder
+- **Symptoms:**
+  - First large coefficient (>500) appears at byte 1713 (CTU 1)
+  - 38 large coefficients detected in example.heic
+  - 269/280 CTUs decode before end_of_slice_segment detected early
+  - Chroma prediction averages drift to impossible values (e.g., 367.6)
+  - RGB output shows extreme color artifacts
+- **Fix:** Implement full context derivation per H.265 sections 9.3.4.2.3 and 9.3.4.2.5
+
+### Other Issues
 - Output dimensions 1280x856 vs reference 1280x854 (missing conformance window cropping)
 
 ## Investigation Notes
@@ -148,6 +158,35 @@ that allows the encoder to infer one sign bit per 4x4 sub-block from coefficient
 - All basic CABAC tests pass (bypass decode, bypass bits, coeff_abs_level_remaining)
 - Can be extended to test more coefficient decoding operations
 
+### Context Derivation Analysis (2026-01-22)
+
+**Debug infrastructure added:** CabacTracker in debug.rs tracks:
+- CTU start byte positions
+- Large coefficient occurrences (>500, indicates CABAC desync)
+- First desync location for debugging
+
+**Findings from example.heic:**
+- First large coefficient at byte 1713 (in CTU 1, very early)
+- 38 total large coefficients detected
+- CABAC state becomes corrupt progressively
+- Chroma prediction averages drift: 128 → 156 → 207 → 367 (impossible)
+
+**Root cause identified:**
+The simplified context selection for sig_coeff_flag (residual.rs:625):
+```rust
+let ctx_idx = context::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 };
+```
+Uses a single context regardless of position, instead of the full H.265 derivation
+which depends on position, sub-block location, TU size, and neighbors.
+
+**Fix needed:** Implement full context derivation per H.265 section 9.3.4.2.5:
+- Calculate sigCtx based on position within 4x4 sub-block
+- Consider coded sub-block flag of neighbors
+- Different logic for luma vs chroma
+- Different logic for position 0 (DC) vs others
+
+**Reference:** libde265 `decode_sig_coeff_flag()` in slice.cc
+
 ### Chroma Bias Analysis (2026-01-21 Session 1)
 - Test image: example.heic (1280x854)
 - Y plane: avg=152 (reasonable for outdoor scene)
@@ -178,7 +217,9 @@ src/
     ├── ctu.rs       # CTU/CU decoding, SliceContext
     ├── intra.rs     # Intra prediction (35 modes)
     ├── cabac.rs     # CABAC decoder, context tables
+    ├── residual.rs  # Transform coefficient parsing
     ├── transform.rs # Inverse DCT/DST
+    ├── debug.rs     # CABAC tracker, invariant checks
     └── picture.rs   # Frame buffer
 ```
 
