@@ -9,6 +9,7 @@
 use alloc::vec::Vec;
 
 use super::cabac::{context, CabacDecoder, ContextModel, INIT_VALUES};
+use super::debug;
 use super::intra;
 use super::params::{Pps, Sps};
 use super::picture::DecodedFrame;
@@ -132,6 +133,9 @@ impl<'a> SliceContext<'a> {
 
     /// Decode all CTUs in the slice
     pub fn decode_slice(&mut self, frame: &mut DecodedFrame) -> Result<()> {
+        // Initialize CABAC tracker for debugging
+        debug::init_tracker();
+
         let ctb_size = self.sps.ctb_size();
         let pic_width_in_ctbs = self.sps.pic_width_in_ctbs();
         let pic_height_in_ctbs = self.sps.pic_height_in_ctbs();
@@ -149,26 +153,25 @@ impl<'a> SliceContext<'a> {
             let x_ctb = self.ctb_x * ctb_size;
             let y_ctb = self.ctb_y * ctb_size;
 
-            // DEBUG: Print CTU state periodically or near failure point
-            let debug_this_ctu = ctu_count % 10 == 0 || ctu_count >= 43;
-            if debug_this_ctu {
+            // Track CTU position for debugging
+            let (byte_pos, _, _) = self.cabac.get_position();
+            debug::track_ctu_start(ctu_count, byte_pos);
+
+            // DEBUG: Print CTU state periodically
+            if ctu_count % 50 == 0 {
                 let (range, offset) = self.cabac.get_state();
-                let (byte_pos, _, _) = self.cabac.get_position();
-                eprintln!("DEBUG: Before CTU {} decode: range={}, offset={} byte_pos={} x={} y={}", ctu_count, range, offset, byte_pos, self.ctb_x, self.ctb_y);
+                eprintln!("DEBUG: CTU {} byte={} cabac=({},{}) x={} y={}",
+                    ctu_count, byte_pos, range, offset, self.ctb_x, self.ctb_y);
             }
-            self.debug_ctu = ctu_count == 46; // Enable detailed debug for CTU 46
+            self.debug_ctu = false;
 
             self.decode_ctu(x_ctb, y_ctb, frame)?;
             ctu_count += 1;
 
             // Check for end of slice segment
-            let (range_before, offset_before) = self.cabac.get_state();
-            let (byte_pos, data_len, bits_read) = self.cabac.get_position();
             let end_of_slice = self.cabac.decode_terminate()?;
             if end_of_slice != 0 {
                 eprintln!("DEBUG: end_of_slice after CTU {}, decoded {}/{} CTUs", ctu_count, ctu_count, total_ctus);
-                eprintln!("DEBUG:   CABAC: range={}, offset={}", range_before, offset_before);
-                eprintln!("DEBUG:   Bitstream: byte_pos={}/{}, bits_read={}", byte_pos, data_len, bits_read);
                 break;
             }
 
@@ -185,8 +188,8 @@ impl<'a> SliceContext<'a> {
             }
         }
 
-        // Note: If ctu_count < total_ctus, CABAC reported end_of_slice_segment early
-        let _ = (ctu_count, total_ctus); // Silence unused warnings
+        // Print CABAC tracker summary
+        debug::print_tracker_summary();
         Ok(())
     }
 

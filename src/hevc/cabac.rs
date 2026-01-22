@@ -141,31 +141,33 @@ impl ContextModel {
     }
 }
 
-/// CABAC decoder
+/// CABAC decoder (libde265-compatible implementation)
+///
+/// This uses the same byte-at-a-time approach as libde265, with a 32-bit value
+/// register and scaled comparisons for bypass decoding.
 pub struct CabacDecoder<'a> {
     /// Input data
     data: &'a [u8],
     /// Current byte position
     byte_pos: usize,
-    /// Bits remaining in current byte
-    bits_left: u8,
-    /// Range register
-    range: u16,
-    /// Offset register (low)
-    offset: u16,
-    /// Number of bits read
-    bits_read: u32,
+    /// Range register (9 bits, 256-510)
+    range: u32,
+    /// Value register (holds ~16 bits of precision)
+    value: u32,
+    /// Bits needed before next byte read (negative means bits available)
+    bits_needed: i32,
 }
 
 impl<'a> CabacDecoder<'a> {
     /// Get current CABAC state (range, offset) for debugging
+    /// Note: returns (range, value >> 7) for compatibility with old debugging
     pub fn get_state(&self) -> (u16, u16) {
-        (self.range, self.offset)
+        (self.range as u16, (self.value >> 7) as u16)
     }
 
     /// Get current bitstream position for debugging
     pub fn get_position(&self) -> (usize, usize, u32) {
-        (self.byte_pos, self.data.len(), self.bits_read)
+        (self.byte_pos, self.data.len(), self.byte_pos as u32 * 8)
     }
 
     /// Create a new CABAC decoder
@@ -177,56 +179,65 @@ impl<'a> CabacDecoder<'a> {
         let mut decoder = Self {
             data,
             byte_pos: 0,
-            bits_left: 0,
             range: 510,
-            offset: 0,
-            bits_read: 0,
+            value: 0,
+            bits_needed: 8,
         };
 
-        // Initialize offset with first 9 bits
-        decoder.offset = decoder.read_bits(9)? as u16;
+        // Initialize value (matching libde265 exactly)
+        decoder.bits_needed = -8;
+        if decoder.byte_pos < decoder.data.len() {
+            decoder.value = decoder.data[decoder.byte_pos] as u32;
+            decoder.byte_pos += 1;
+        }
+        decoder.value <<= 8;
+        decoder.bits_needed = 0;
+        if decoder.byte_pos < decoder.data.len() {
+            decoder.value |= decoder.data[decoder.byte_pos] as u32;
+            decoder.byte_pos += 1;
+            decoder.bits_needed = -8;
+        }
 
         Ok(decoder)
     }
 
-    /// Read raw bits from the bitstream
-    fn read_bits(&mut self, n: u8) -> Result<u32> {
-        let mut value = 0u32;
+    /// Read a single bit from the bitstream (for regular context decoding)
+    fn read_bit(&mut self) -> Result<u32> {
+        self.value <<= 1;
+        self.bits_needed += 1;
 
-        for _ in 0..n {
-            if self.bits_left == 0 {
-                if self.byte_pos >= self.data.len() {
-                    return Err(HevcError::CabacError("unexpected end of data"));
-                }
-                self.bits_left = 8;
+        if self.bits_needed >= 0 {
+            if self.byte_pos < self.data.len() {
+                self.bits_needed = -8;
+                self.value |= self.data[self.byte_pos] as u32;
                 self.byte_pos += 1;
+            } else {
+                self.bits_needed = -8;
             }
-
-            self.bits_left -= 1;
-            let bit = (self.data[self.byte_pos - 1] >> self.bits_left) & 1;
-            value = (value << 1) | bit as u32;
         }
 
-        self.bits_read += n as u32;
-        Ok(value)
+        Ok(0) // Return value not used, just for error handling
     }
 
     /// Decode a single bin using context model
     pub fn decode_bin(&mut self, ctx: &mut ContextModel) -> Result<u8> {
         let q_range_idx = (self.range >> 6) & 3;
-        let lps_range = LPS_TABLE[ctx.state as usize][q_range_idx as usize] as u16;
+        let lps_range = LPS_TABLE[ctx.state as usize][q_range_idx as usize] as u32;
 
         self.range -= lps_range;
 
+        // Scale for comparison
+        let scaled_range = self.range << 7;
+
         let bin_val;
-        if self.offset < self.range {
+        if self.value < scaled_range {
             // MPS path
             bin_val = ctx.mps;
             ctx.state = STATE_TRANS_MPS[ctx.state as usize];
         } else {
             // LPS path
             bin_val = 1 - ctx.mps;
-            self.offset -= self.range;
+            self.value -= scaled_range;
             self.range = lps_range;
 
             if ctx.state == 0 {
@@ -241,12 +252,24 @@ impl<'a> CabacDecoder<'a> {
         Ok(bin_val)
     }
 
-    /// Decode a bypass bin (equal probability)
+    /// Decode a bypass bin (equal probability) - libde265 compatible
     pub fn decode_bypass(&mut self) -> Result<u8> {
-        self.offset = (self.offset << 1) | self.read_bits(1)? as u16;
+        self.value <<= 1;
+        self.bits_needed += 1;
 
-        if self.offset >= self.range {
-            self.offset -= self.range;
+        if self.bits_needed >= 0 {
+            if self.byte_pos < self.data.len() {
+                self.bits_needed = -8;
+                self.value |= self.data[self.byte_pos] as u32;
+                self.byte_pos += 1;
+            } else {
+                self.bits_needed = -8;
+            }
+        }
+
+        let scaled_range = self.range << 7;
+        if self.value >= scaled_range {
+            self.value -= scaled_range;
             Ok(1)
         } else {
             Ok(0)
@@ -255,18 +278,19 @@ impl<'a> CabacDecoder<'a> {
 
     /// Decode multiple bypass bins
     pub fn decode_bypass_bits(&mut self, n: u8) -> Result<u32> {
-        let mut value = 0u32;
+        let mut result = 0u32;
         for _ in 0..n {
-            value = (value << 1) | self.decode_bypass()? as u32;
+            result = (result << 1) | self.decode_bypass()? as u32;
         }
-        Ok(value)
+        Ok(result)
     }
 
     /// Decode a terminate bin (end of slice check)
     pub fn decode_terminate(&mut self) -> Result<u8> {
         self.range -= 2;
 
-        if self.offset >= self.range {
+        let scaled_range = self.range << 7;
+        if self.value >= scaled_range {
             Ok(1)
         } else {
             self.renormalize()?;
@@ -278,8 +302,11 @@ impl<'a> CabacDecoder<'a> {
     fn renormalize(&mut self) -> Result<()> {
         while self.range < 256 {
             self.range <<= 1;
-            self.offset = (self.offset << 1) | self.read_bits(1)? as u16;
+            // Shift value and read more bits
+            self.read_bit()?;
         }
+        // Invariant: after renormalization, range >= 256
+        debug_assert!(self.range >= 256, "range {} < 256 after renorm", self.range);
         Ok(())
     }
 

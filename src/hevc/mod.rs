@@ -6,6 +6,7 @@
 mod bitstream;
 mod cabac;
 mod ctu;
+pub mod debug;
 mod intra;
 mod params;
 mod picture;

@@ -4,6 +4,7 @@
 //! and applying inverse transforms to residuals.
 
 use super::cabac::{context, CabacDecoder, ContextModel};
+use super::debug;
 use super::transform::MAX_COEFF;
 use crate::error::HevcError;
 
@@ -172,6 +173,9 @@ pub fn decode_residual(
     sign_data_hiding_enabled: bool,
     cu_transquant_bypass: bool,
 ) -> Result<CoeffBuffer> {
+    // Track initial CABAC state for debugging
+    let (init_range, init_offset) = cabac.get_state();
+
     let mut buffer = CoeffBuffer::new(log2_size);
     let size = 1u32 << log2_size;
 
@@ -398,19 +402,24 @@ pub fn decode_residual(
         // Decode remaining levels for all coefficients that need it
         // Rice parameter starts at 0 and is updated adaptively
         let mut rice_param = 0u8;
+
+        // Decode remaining levels for coefficients that need it
         for n in (0..=start_pos).rev() {
             if coeff_flags[n as usize] && needs_remaining[n as usize] {
                 let base = coeff_values[n as usize];
+
                 let (remaining, new_rice) =
                     decode_coeff_abs_level_remaining(cabac, rice_param, base)?;
                 rice_param = new_rice;
-                coeff_values[n as usize] = base + remaining;
+                let final_value = base + remaining;
+                coeff_values[n as usize] = final_value;
             }
         }
 
         // Apply signs and compute sum for parity inference
         // At this point coeff_values[] are all positive (absolute values)
         let mut sum_abs_level = 0i32;
+
         for (i, &pos) in sig_positions[..n_sig].iter().enumerate() {
             let pos = pos as usize;
             if coeff_signs[i] != 0 {
@@ -430,11 +439,19 @@ pub fn decode_residual(
             if coeff_flags[n] {
                 let x = sb_x as usize * 4 + px as usize;
                 let y = sb_y as usize * 4 + py as usize;
+
                 buffer.set(x, y, coeff_values[n]);
+
+                // Invariant check: track large coefficients (indicates CABAC desync)
+                if coeff_values[n].abs() > 500 {
+                    let (byte_pos, _, _) = cabac.get_position();
+                    debug::track_large_coeff(byte_pos);
+                }
             }
         }
     }
 
+    let _ = (init_range, init_offset); // Used for future debugging if needed
     Ok(buffer)
 }
 
