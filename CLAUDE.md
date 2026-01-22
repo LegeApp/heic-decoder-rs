@@ -10,6 +10,8 @@ Pure Rust HEIC/HEIF image decoder. No C/C++ dependencies.
 cargo build
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo test --test compare_reference -- --nocapture  # SSIM2 comparison
+cargo test --test compare_reference write_comparison_images -- --nocapture --ignored  # Write PPMs
 ```
 
 ## Test Files
@@ -118,8 +120,18 @@ pub fn decode_rgba_into(
 - **Current status after fixes (2026-01-22):**
   - All 280 CTUs decode successfully
   - Large coefficients (>500): 24 edge cases from simplified context handling
-  - Output image is visually reasonable (pixel avg=138, range 0-255)
   - Conformance window cropping implemented (1280x854 output)
+
+### SSIM2 Comparison Results (2026-01-22)
+
+Comparison against reference decoder (heic-wasm-rs / libheif):
+- **SSIM2 score: -1082** (very poor, >90 is imperceptible, >70 is good)
+- **Average pixel difference: 87** (target: <5 for good quality)
+- **Max pixel difference: 255** (some pixels completely wrong)
+- **Histogram:** Only 32.9% of pixels within 50 units of reference
+
+The 24 large coefficients from CABAC desync are corrupting the image significantly.
+Visual comparison images written to `/tmp/reference.ppm`, `/tmp/our_decoder.ppm`, `/tmp/difference.ppm`.
 
 - **last_significant_coeff_prefix context:**
   - Using flat ctxOffset=0 for luma instead of size-dependent offset
