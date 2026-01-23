@@ -347,6 +347,44 @@ all residual calls to find first divergence point.
 **Recommended next step:** Add test that compares CABAC state at START of each
 residual call between Rust and C++ (requires deeper libde265 integration).
 
+### Deep libde265 Comparison (2026-01-23)
+
+**DC inference logic verified** (libde265 slice.cc:3096-3227):
+- For middle sub-blocks (0 < i < lastSubBlock): inferSbDcSigCoeffFlag=1
+- For first/last sub-blocks: inferSbDcSigCoeffFlag=0 (never inferred)
+- Our code matches: `infer_sb_dc_sig = coded` for middle, `false` for first/last
+
+**ctxSet derivation verified** (libde265 slice.cc:3246-3250, 2392-2418):
+- Base: 0 for DC subblock or chroma, 2 for other luma
+- +1 if previous subblock's final greater1Ctx was 0
+- Our code uses `prev_subblock_had_gt1` which is equivalent check
+
+**greater1Ctx state machine verified** (libde265 slice.cc:2404-2415):
+- Reset to 1 at subblock start
+- If previous g1=1: set to 0
+- Else if >0: increment
+- Once 0, stays 0 for rest of subblock
+
+**Call#0 coefficient output verified:**
+```
+coeffs at (0,0): [-45, 18, -4, 1], [-30, -21, 2, 3], [63, -2, -5, 2], [0, 1, -2, 2]
+```
+- Position n=5 (scan pos (0,2)) = 63, sign=positive, matches debug trace
+- All sign and remaining decodes produce consistent output
+
+**Remaining mystery:** Why does call#157 starting state (328, 239) at byte 1101
+produce corrupted output if all operations are individually correct?
+
+**Possible causes (not yet tested):**
+1. Different split_transform_flag decisions leading to different TU traversal
+2. Different cbf flag propagation between transform tree levels
+3. Off-by-one in coded_sub_block_flag neighbor calculation for edge cases
+4. Accumulated rounding or precision differences
+
+**Recommended next step:** Extend hevc-compare to decode complete residual
+blocks and compare coefficient arrays. Finding first mismatched TU would
+localize the bug precisely.
+
 ### Context Derivation Analysis (2026-01-22)
 
 **Debug infrastructure added:** CabacTracker in debug.rs tracks:
