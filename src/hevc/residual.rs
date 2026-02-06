@@ -840,7 +840,8 @@ fn decode_last_sig_coeff_prefix(
     let mut prefix = 0u32;
     while prefix < max_prefix as u32 {
         let ctx_idx = ctx_base + ctx_offset + ((prefix as usize) >> ctx_shift as usize);
-        cabac.trace_ctx_idx = ctx_idx as i32;
+        #[cfg(feature = "trace-coefficients")]
+        { cabac.trace_ctx_idx = ctx_idx as i32; }
         let bin = cabac.decode_bin(&mut ctx[ctx_idx])?;
         if bin == 0 {
             break;
@@ -860,7 +861,8 @@ fn decode_coded_sub_block_flag_simple(
 ) -> Result<bool> {
     // Simplified: always use ctx 0 or 2
     let ctx_idx = context::CODED_SUB_BLOCK_FLAG + if c_idx > 0 { 2 } else { 0 };
-    cabac.trace_ctx_idx = ctx_idx as i32;
+    #[cfg(feature = "trace-coefficients")]
+    { cabac.trace_ctx_idx = ctx_idx as i32; }
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
@@ -878,7 +880,8 @@ fn decode_coded_sub_block_flag(
     // csbfCtx = 1 if either neighbor is coded, else 0
     let csbf_ctx = if csbf_neighbors != 0 { 1 } else { 0 };
     let ctx_idx = context::CODED_SUB_BLOCK_FLAG + csbf_ctx + if c_idx > 0 { 2 } else { 0 };
-    cabac.trace_ctx_idx = ctx_idx as i32;
+    #[cfg(feature = "trace-coefficients")]
+    { cabac.trace_ctx_idx = ctx_idx as i32; }
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
@@ -1025,7 +1028,8 @@ fn decode_sig_coeff_flag(
         }
     }
 
-    cabac.trace_ctx_idx = ctx_idx as i32;
+    #[cfg(feature = "trace-coefficients")]
+    { cabac.trace_ctx_idx = ctx_idx as i32; }
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
@@ -1043,7 +1047,8 @@ fn decode_coeff_greater1_flag(
         + if c_idx > 0 { 16 } else { 0 }
         + (ctx_set as usize) * 4
         + (greater1_ctx as usize).min(3);
-    cabac.trace_ctx_idx = ctx_idx as i32;
+    #[cfg(feature = "trace-coefficients")]
+    { cabac.trace_ctx_idx = ctx_idx as i32; }
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
@@ -1057,7 +1062,8 @@ fn decode_coeff_greater2_flag(
 ) -> Result<bool> {
     let ctx_idx =
         context::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 } + ctx_set as usize;
-    cabac.trace_ctx_idx = ctx_idx as i32;
+    #[cfg(feature = "trace-coefficients")]
+    { cabac.trace_ctx_idx = ctx_idx as i32; }
     Ok(cabac.decode_bin(&mut ctx[ctx_idx])? != 0)
 }
 
