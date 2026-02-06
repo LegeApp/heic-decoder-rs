@@ -1564,12 +1564,23 @@ impl<'a> SliceContext<'a> {
         // Read 2 fixed-length bypass bits for modes 0-3
         let mode_idx = self.cabac.decode_bypass_bits(2)? as u8;
 
-        let intra_chroma_mode = match mode_idx {
-            0 => IntraPredMode::Planar,
-            1 => IntraPredMode::Angular26, // Vertical
-            2 => IntraPredMode::Angular10, // Horizontal
-            _ => IntraPredMode::Dc,        // mode_idx == 3
-        };
+        // Table 8-4: candidate list is [Planar, Angular26, Angular10, DC, DM(luma)]
+        // The first 4 entries form the base list; if any equals luma_mode, replace with Angular34
+        let candidates = [
+            IntraPredMode::Planar,
+            IntraPredMode::Angular26,
+            IntraPredMode::Angular10,
+            IntraPredMode::Dc,
+        ];
+
+        let mut chroma_candidates = candidates;
+        for c in &mut chroma_candidates {
+            if *c == luma_mode {
+                *c = IntraPredMode::Angular34;
+            }
+        }
+
+        let intra_chroma_mode = chroma_candidates[mode_idx as usize];
 
         Ok(intra_chroma_mode)
     }
