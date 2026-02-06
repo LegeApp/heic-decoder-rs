@@ -70,6 +70,12 @@ pub struct SliceContext<'a> {
     ct_depth_map: Vec<u8>,
     /// Width of ct_depth_map in min_cb_size units
     ct_depth_map_stride: u32,
+    /// Per-4x4-block intra prediction mode for luma (for scan order determination)
+    intra_pred_mode_y: Vec<u8>,
+    /// Per-4x4-block intra prediction mode for chroma (for scan order determination)
+    intra_pred_mode_c: Vec<u8>,
+    /// Stride for intra_pred_mode arrays in 4x4 block units
+    intra_pred_stride: u32,
 }
 
 impl<'a> SliceContext<'a> {
@@ -144,6 +150,12 @@ impl<'a> SliceContext<'a> {
         let ct_depth_map_height = sps.pic_height_in_luma_samples.div_ceil(min_cb_size);
         let ct_depth_map = vec![0xFF; (ct_depth_map_stride * ct_depth_map_height) as usize];
 
+        // Initialize per-4x4-block intra prediction mode map
+        let intra_pred_stride = sps.pic_width_in_luma_samples.div_ceil(4);
+        let intra_pred_height = sps.pic_height_in_luma_samples.div_ceil(4);
+        let intra_pred_mode_y = vec![0u8; (intra_pred_stride * intra_pred_height) as usize];
+        let intra_pred_mode_c = vec![0u8; (intra_pred_stride * intra_pred_height) as usize];
+
         Ok(Self {
             sps,
             pps,
@@ -162,7 +174,60 @@ impl<'a> SliceContext<'a> {
             chroma_pred_count: 0,
             ct_depth_map,
             ct_depth_map_stride,
+            intra_pred_mode_y,
+            intra_pred_mode_c,
+            intra_pred_stride,
         })
+    }
+
+    /// Store intra prediction mode for luma at a given position covering size×size pixels
+    fn set_intra_pred_mode(&mut self, x: u32, y: u32, size: u32, mode: IntraPredMode) {
+        let blocks = (size / 4).max(1);
+        let bx = x / 4;
+        let by = y / 4;
+        for dy in 0..blocks {
+            for dx in 0..blocks {
+                let idx = ((by + dy) * self.intra_pred_stride + bx + dx) as usize;
+                if idx < self.intra_pred_mode_y.len() {
+                    self.intra_pred_mode_y[idx] = mode.as_u8();
+                }
+            }
+        }
+    }
+
+    /// Get stored intra prediction mode for luma at a given position
+    fn get_intra_pred_mode(&self, x: u32, y: u32) -> IntraPredMode {
+        let idx = ((y / 4) * self.intra_pred_stride + x / 4) as usize;
+        if idx < self.intra_pred_mode_y.len() {
+            IntraPredMode::from_u8(self.intra_pred_mode_y[idx]).unwrap_or(IntraPredMode::Planar)
+        } else {
+            IntraPredMode::Planar
+        }
+    }
+
+    /// Store intra prediction mode for chroma at a given position (luma coordinates)
+    fn set_intra_pred_mode_c(&mut self, x: u32, y: u32, size: u32, mode: IntraPredMode) {
+        let blocks = (size / 4).max(1);
+        let bx = x / 4;
+        let by = y / 4;
+        for dy in 0..blocks {
+            for dx in 0..blocks {
+                let idx = ((by + dy) * self.intra_pred_stride + bx + dx) as usize;
+                if idx < self.intra_pred_mode_c.len() {
+                    self.intra_pred_mode_c[idx] = mode.as_u8();
+                }
+            }
+        }
+    }
+
+    /// Get stored intra prediction mode for chroma at a given luma position
+    fn get_intra_pred_mode_c(&self, x: u32, y: u32) -> IntraPredMode {
+        let idx = ((y / 4) * self.intra_pred_stride + x / 4) as usize;
+        if idx < self.intra_pred_mode_c.len() {
+            IntraPredMode::from_u8(self.intra_pred_mode_c[idx]).unwrap_or(IntraPredMode::Planar)
+        } else {
+            IntraPredMode::Planar
+        }
     }
 
     /// Decode all CTUs in the slice
@@ -199,7 +264,8 @@ impl<'a> SliceContext<'a> {
                     ctu_count, byte_pos, range, offset, self.ctb_x, self.ctb_y
                 );
             }
-            self.debug_ctu = false;
+            // Enable verbose debug for first CTU to trace cbf_luma etc
+            self.debug_ctu = ctu_count == 0;
 
             self.decode_ctu(x_ctb, y_ctb, frame)?;
             ctu_count += 1;
@@ -254,11 +320,18 @@ impl<'a> SliceContext<'a> {
     /// Decode SAO (Sample Adaptive Offset) parameters for a CTU
     /// Per H.265 7.3.8.3: sao_merge_left_flag/sao_merge_up_flag only present when neighbor exists
     fn decode_sao(&mut self, x_ctb: u32, y_ctb: u32) -> Result<()> {
-        let ctx_idx = context::SAO_MERGE_FLAG;
-        
+        #[cfg(feature = "trace-coefficients")]
+        {
+            let (r, o) = self.cabac.get_state();
+            let (byte, _, _) = self.cabac.get_position();
+            eprintln!("SAO: start at ({},{}) byte={} cabac=({},{})", x_ctb, y_ctb, byte, r, o);
+        }
+
         // sao_merge_left_flag only present if leftCtbInSliceSeg is available (x > 0)
         let sao_merge_left_flag = if x_ctb > 0 {
-            self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = context::SAO_MERGE_FLAG as i32; }
+            self.cabac.decode_bin(&mut self.ctx[context::SAO_MERGE_FLAG])? != 0
         } else {
             false
         };
@@ -266,71 +339,102 @@ impl<'a> SliceContext<'a> {
         if !sao_merge_left_flag {
             // sao_merge_up_flag only present if upCtbInSliceSeg is available (y > 0)
             let sao_merge_up_flag = if y_ctb > 0 {
-                self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = context::SAO_MERGE_FLAG as i32; }
+                self.cabac.decode_bin(&mut self.ctx[context::SAO_MERGE_FLAG])? != 0
             } else {
                 false
             };
 
             if !sao_merge_up_flag {
-                // Decode SAO type and parameters for each component
-                for c_idx in 0..3 {
-                    self.decode_sao_type_idx(c_idx)?;
+                // Per H.265 Section 7.3.8.3:
+                // - sao_type_idx_luma decoded for c_idx=0
+                // - sao_type_idx_chroma decoded for c_idx=1
+                // - c_idx=2 (Cr) inherits type from c_idx=1 (Cb) — NOT decoded
+                // - sao_eo_class decoded only for c_idx < 2; c_idx=2 inherits from c_idx=1
+                // - sao_offset_abs decoded for all 3 components if type != 0
+                // - sao_offset_sign and sao_band_position only for band offset (type=1)
+                let mut sao_type = [0u8; 3]; // 0=none, 1=band, 2=edge
+
+                for c_idx in 0..3u8 {
+                    // Type index: only decoded for c_idx < 2
+                    if c_idx < 2 {
+                        #[cfg(feature = "trace-coefficients")]
+                        { self.cabac.trace_ctx_idx = context::SAO_TYPE_IDX as i32; }
+                        let first_bin = self.cabac.decode_bin(&mut self.ctx[context::SAO_TYPE_IDX])? != 0;
+
+                        #[cfg(feature = "trace-coefficients")]
+                        {
+                            let (r, o) = self.cabac.get_state();
+                            let (byte, _, _) = self.cabac.get_position();
+                            eprintln!("SAO: c_idx={} first_bin={} byte={} cabac=({},{})", c_idx, first_bin, byte, r, o);
+                        }
+
+                        if first_bin {
+                            let second_bin = self.cabac.decode_bypass()? != 0;
+                            // TR binarization cMax=2: value=1 → bins "10", value=2 → bins "11"
+                            // second_bin=0 → value=1 (band), second_bin=1 → value=2 (edge)
+                            sao_type[c_idx as usize] = if second_bin { 2 } else { 1 };
+
+                            #[cfg(feature = "trace-coefficients")]
+                            eprintln!("SAO: c_idx={} type={} (1=band, 2=edge)", c_idx, sao_type[c_idx as usize]);
+                        }
+                    } else {
+                        // c_idx=2: inherit type from c_idx=1
+                        sao_type[2] = sao_type[1];
+
+                        #[cfg(feature = "trace-coefficients")]
+                        eprintln!("SAO: c_idx=2 inherited type={} from c_idx=1", sao_type[2]);
+                    }
+
+                    // Decode offsets if SAO is enabled for this component
+                    if sao_type[c_idx as usize] != 0 {
+                        // Decode 4 offset absolute values (unary bypass coding)
+                        let mut offset_abs = [0u32; 4];
+                        for i in 0..4 {
+                            let mut abs_val = 0u32;
+                            loop {
+                                let bin = self.cabac.decode_bypass()?;
+                                if bin == 0 {
+                                    break;
+                                }
+                                abs_val += 1;
+                                if abs_val >= 31 {
+                                    break;
+                                }
+                            }
+                            offset_abs[i] = abs_val;
+                        }
+
+                        if sao_type[c_idx as usize] == 1 {
+                            // Band offset: decode signs for non-zero offsets, then band_position
+                            for i in 0..4 {
+                                if offset_abs[i] > 0 {
+                                    let _sign = self.cabac.decode_bypass()?;
+                                }
+                            }
+                            let _band_position = self.cabac.decode_bypass_bits(5)?;
+                        } else {
+                            // Edge offset: decode eo_class only for c_idx < 2
+                            // (c_idx=2 inherits eo_class from c_idx=1)
+                            // No sign decoding for edge offset (signs derived from edge class)
+                            if c_idx < 2 {
+                                let _eo_class = self.cabac.decode_bypass_bits(2)?;
+                                #[cfg(feature = "trace-coefficients")]
+                                eprintln!("SAO: c_idx={} eo_class={}", c_idx, _eo_class);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        Ok(())
-    }
-
-    /// Decode SAO type index and offset values for a component
-    fn decode_sao_type_idx(&mut self, c_idx: u8) -> Result<()> {
-        // SAO_TYPE_IDX uses a single context for all components
-        let ctx_idx = context::SAO_TYPE_IDX;
-
-        // Decode sao_type_idx (0=not used, 1=band offset, 2=edge offset)
-        let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
-
-        if first_bin {
-            let second_bin = self.cabac.decode_bypass()? != 0;
-            let sao_type = if second_bin { 1 } else { 2 }; // 1=band, 2=edge
-
-            if sao_type == 2 {
-                // Edge offset: decode eo_class (2 bits bypass)
-                let _eo_class = self.cabac.decode_bypass_bits(2)?;
-            }
-
-            // Decode offset values
-            self.decode_sao_offset_abs(c_idx)?;
+        #[cfg(feature = "trace-coefficients")]
+        {
+            let (r, o) = self.cabac.get_state();
+            let (byte, _, _) = self.cabac.get_position();
+            eprintln!("SAO: end byte={} cabac=({},{})", byte, r, o);
         }
-
-        Ok(())
-    }
-
-    /// Decode SAO offset absolute values and signs
-    fn decode_sao_offset_abs(&mut self, _c_idx: u8) -> Result<()> {
-        // Decode 4 offset absolute values (truncated rice code)
-        for _ in 0..4 {
-            // Simplified: decode as bypass bits (actual implementation uses truncated rice)
-            let mut abs_val = 0u32;
-            loop {
-                let bin = self.cabac.decode_bypass()?;
-                if bin == 0 {
-                    break;
-                }
-                abs_val += 1;
-                if abs_val >= 31 {
-                    break; // Max value
-                }
-            }
-
-            // If non-zero, decode sign (except for band offset type where signs are pre-determined)
-            if abs_val > 0 {
-                let _sign = self.cabac.decode_bypass()?;
-            }
-        }
-
-        // For band offset: decode band position (5 bits bypass)
-        let _band_position = self.cabac.decode_bypass_bits(5)?;
 
         Ok(())
     }
@@ -385,8 +489,10 @@ impl<'a> SliceContext<'a> {
         };
 
         // Handle QP delta depth
+        // Per H.265 spec 7.4.9.10: IsCuQpDeltaCoded = 0 when log2CbSize >= Log2MinCuQpDeltaSize
+        // where Log2MinCuQpDeltaSize = CtbLog2SizeY - diff_cu_qp_delta_depth
         if self.pps.cu_qp_delta_enabled_flag
-            && log2_cb_size >= self.pps.diff_cu_qp_delta_depth + self.sps.log2_min_cb_size()
+            && log2_cb_size >= self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth
         {
             self.is_cu_qp_delta_coded = false;
             self.cu_qp_delta = 0;
@@ -494,6 +600,8 @@ impl<'a> SliceContext<'a> {
         }
 
         let ctx_idx = context::SPLIT_CU_FLAG + cond_l + cond_a;
+        #[cfg(feature = "trace-coefficients")]
+        { self.cabac.trace_ctx_idx = ctx_idx as i32; }
         let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
 
         // DEBUG: Print first few split decisions
@@ -528,6 +636,8 @@ impl<'a> SliceContext<'a> {
         // Decode transquant_bypass_flag if enabled
         self.cu_transquant_bypass_flag = if self.pps.transquant_bypass_enabled_flag {
             let ctx_idx = context::CU_TRANSQUANT_BYPASS_FLAG;
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = ctx_idx as i32; }
             self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0
         } else {
             false
@@ -561,6 +671,8 @@ impl<'a> SliceContext<'a> {
             PartMode::Part2Nx2N => {
                 // Single PU covering entire CU
                 let mode = self.decode_intra_prediction(x0, y0, log2_cb_size, true, frame)?;
+                // Store intra mode for all 4x4 blocks in this CU
+                self.set_intra_pred_mode(x0, y0, cb_size, mode);
                 if self.debug_ctu {
                     let (r, o) = self.cabac.get_state();
                     eprintln!(
@@ -582,19 +694,39 @@ impl<'a> SliceContext<'a> {
                 // CRITICAL for CABAC sync: Per HEVC spec 7.3.8.5:
                 // Loop 1: Decode ALL 4 prev_intra_luma_pred_flags first
                 let ctx_idx = context::PREV_INTRA_LUMA_PRED_FLAG;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let prev_flag_0 = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let prev_flag_1 = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let prev_flag_2 = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let prev_flag_3 = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
 
                 // Loop 2: Decode all 4 modes based on flags
+                // CRITICAL: Store each mode IMMEDIATELY after decoding so that
+                // subsequent sub-PUs can use it as a neighbor for MPM derivation.
                 let luma_mode_0 = self.decode_intra_mode_from_flag(prev_flag_0, x0, y0)?;
+                self.set_intra_pred_mode(x0, y0, half, luma_mode_0);
+
                 let luma_mode_1 = self.decode_intra_mode_from_flag(prev_flag_1, x0 + half, y0)?;
+                self.set_intra_pred_mode(x0 + half, y0, half, luma_mode_1);
+
                 let luma_mode_2 = self.decode_intra_mode_from_flag(prev_flag_2, x0, y0 + half)?;
+                self.set_intra_pred_mode(x0, y0 + half, half, luma_mode_2);
+
                 let luma_mode_3 = self.decode_intra_mode_from_flag(prev_flag_3, x0 + half, y0 + half)?;
+                self.set_intra_pred_mode(x0 + half, y0 + half, half, luma_mode_3);
 
                 // Decode chroma mode once (using first luma mode for derivation if mode=4)
                 let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
+
+                // Store chroma mode for all blocks in this CU
+                self.set_intra_pred_mode_c(x0, y0, cb_size, chroma_mode);
 
                 // Apply luma predictions for all 4 PUs
                 intra::predict_intra(frame, x0, y0, log2_pu_size, luma_mode_0, 0);
@@ -621,6 +753,8 @@ impl<'a> SliceContext<'a> {
         // For intra, this is always coded (not signaled, assumed 1)
         // unless transquant_bypass is enabled
         if !self.cu_transquant_bypass_flag {
+            // IntraSplitFlag = 1 when part_mode is NxN (H.265 spec 7.4.9.8)
+            let intra_split_flag = part_mode == PartMode::PartNxN;
             // Decode transform tree
             self.decode_transform_tree(
                 x0,
@@ -628,6 +762,7 @@ impl<'a> SliceContext<'a> {
                 log2_cb_size,
                 0, // trafo_depth
                 intra_mode,
+                intra_split_flag,
                 frame,
             )?;
 
@@ -651,6 +786,7 @@ impl<'a> SliceContext<'a> {
         log2_size: u8,
         trafo_depth: u8,
         intra_mode: IntraPredMode,
+        intra_split_flag: bool,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         // For 4:2:0, start with root having chroma responsibility
@@ -660,6 +796,7 @@ impl<'a> SliceContext<'a> {
             log2_size,
             trafo_depth,
             intra_mode,
+            intra_split_flag,
             true,
             true,
             frame,
@@ -676,11 +813,14 @@ impl<'a> SliceContext<'a> {
         log2_size: u8,
         trafo_depth: u8,
         intra_mode: IntraPredMode,
+        intra_split_flag: bool,
         cbf_cb_parent: bool,
         cbf_cr_parent: bool,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
-        let max_trafo_depth = self.sps.max_transform_hierarchy_depth_intra;
+        // H.265 spec (7.4.9.8): MaxTrafoDepth = max_transform_hierarchy_depth_intra + IntraSplitFlag
+        let max_trafo_depth = self.sps.max_transform_hierarchy_depth_intra
+            + if intra_split_flag { 1 } else { 0 };
         let log2_min_trafo_size = self.sps.log2_min_tb_size();
         let log2_max_trafo_size = self.sps.log2_max_tb_size();
 
@@ -693,12 +833,26 @@ impl<'a> SliceContext<'a> {
         let debug_tt = self.debug_ctu;
 
         // Step 1: Determine if we should split
-        let split_transform = if log2_size <= log2_max_trafo_size
+        // H.265 spec 7.3.8.7: split_transform_flag is decoded when:
+        //   log2TrafoSize <= MaxTbLog2SizeY && log2TrafoSize > MinTbLog2SizeY &&
+        //   trafoDepth < MaxTrafoDepth && !(IntraSplitFlag && trafoDepth == 0)
+        // When IntraSplitFlag==1 && trafoDepth==0, split is forced to true (implicit)
+        let split_transform = if intra_split_flag && trafo_depth == 0 {
+            // H.265 spec: IntraNxN at root level forces split (not coded)
+            if debug_tt {
+                eprintln!(
+                    "    TT(1144,120): split forced (IntraSplitFlag=1, depth=0)"
+                );
+            }
+            true
+        } else if log2_size <= log2_max_trafo_size
             && log2_size > log2_min_trafo_size
             && trafo_depth < max_trafo_depth
         {
             // Decode split_transform_flag
             let ctx_idx = context::SPLIT_TRANSFORM_FLAG + (5 - log2_size as usize).min(2);
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = ctx_idx as i32; }
             let flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
             if debug_tt {
                 let (r, o) = self.cabac.get_state();
@@ -732,6 +886,8 @@ impl<'a> SliceContext<'a> {
             // Decode cbf_cb if trafo_depth == 0 (always) or parent had cbf_cb
             let cb = if trafo_depth == 0 || cbf_cb_parent {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
                 if debug_tt {
                     let (r, o) = self.cabac.get_state();
@@ -747,6 +903,8 @@ impl<'a> SliceContext<'a> {
             // Decode cbf_cr if trafo_depth == 0 (always) or parent had cbf_cr
             let cr = if trafo_depth == 0 || cbf_cr_parent {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx as i32; }
                 let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
                 if debug_tt {
                     let (r, o) = self.cabac.get_state();
@@ -783,6 +941,7 @@ impl<'a> SliceContext<'a> {
                 new_log2_size,
                 new_depth,
                 intra_mode,
+                intra_split_flag,
                 cbf_cb,
                 cbf_cr,
                 frame,
@@ -793,6 +952,7 @@ impl<'a> SliceContext<'a> {
                 new_log2_size,
                 new_depth,
                 intra_mode,
+                intra_split_flag,
                 cbf_cb,
                 cbf_cr,
                 frame,
@@ -803,6 +963,7 @@ impl<'a> SliceContext<'a> {
                 new_log2_size,
                 new_depth,
                 intra_mode,
+                intra_split_flag,
                 cbf_cb,
                 cbf_cr,
                 frame,
@@ -813,6 +974,7 @@ impl<'a> SliceContext<'a> {
                 new_log2_size,
                 new_depth,
                 intra_mode,
+                intra_split_flag,
                 cbf_cb,
                 cbf_cr,
                 frame,
@@ -821,13 +983,16 @@ impl<'a> SliceContext<'a> {
             // For 4:2:0, if we split from 8x8 to 4x4, decode chroma residuals now
             // (because 4x4 children can't have chroma TUs)
             if log2_size == 3 {
-                let scan_order = residual::get_scan_order(2, intra_mode.as_u8(), 1);
+                // Use stored chroma intra mode for chroma scan order
+                let chroma_mode = self.get_intra_pred_mode_c(x0, y0);
+                let scan_order_cb = residual::get_scan_order(2, chroma_mode.as_u8(), 1);
 
                 if cbf_cb {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 1, scan_order, frame)?;
+                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 1, scan_order_cb, frame)?;
                 }
                 if cbf_cr {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 2, scan_order, frame)?;
+                    let scan_order_cr = residual::get_scan_order(2, chroma_mode.as_u8(), 2);
+                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 2, scan_order_cr, frame)?;
                 }
             }
         } else {
@@ -862,12 +1027,16 @@ impl<'a> SliceContext<'a> {
     ) -> Result<()> {
         let debug_tt = self.debug_ctu;
 
-        // Decode cbf_luma - coded if trafo_depth == 0 OR there's chroma residual
-        // If not coded (trafo_depth > 0 AND no chroma cbf), it's implicitly 1
-        let cbf_luma = if trafo_depth == 0 || cbf_cb || cbf_cr {
+        // Decode cbf_luma - Per H.265 spec 7.3.8.8:
+        // Condition: CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr
+        // For I-slice, CuPredMode is always INTRA, so cbf_luma is ALWAYS decoded
+        let is_intra = true; // I-slice: always intra
+        let cbf_luma = if is_intra || trafo_depth != 0 || cbf_cb || cbf_cr {
             // Context: offset 0 if trafo_depth > 0, offset 1 if trafo_depth == 0
             let ctx_offset = if trafo_depth == 0 { 1 } else { 0 };
             let ctx_idx = context::CBF_LUMA + ctx_offset;
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = ctx_idx as i32; }
             let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
             if debug_tt {
                 let (r, o) = self.cabac.get_state();
@@ -888,12 +1057,71 @@ impl<'a> SliceContext<'a> {
         };
 
         // Decode and apply luma residuals
+        if cbf_luma || cbf_cb || cbf_cr {
+            // H.265 spec 7.3.8.11: Decode cu_qp_delta_abs BEFORE residual data
+            // when cu_qp_delta_enabled_flag is set and not yet coded for this CU
+            if self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
+                // cu_qp_delta_abs: TU(5) binarization with context-coded prefix
+                // First bin: CU_QP_DELTA_ABS + 0, subsequent bins: CU_QP_DELTA_ABS + 1
+                let mut cu_qp_delta_abs: i32 = 0;
+                let ctx_idx0 = context::CU_QP_DELTA_ABS;
+                #[cfg(feature = "trace-coefficients")]
+                { self.cabac.trace_ctx_idx = ctx_idx0 as i32; }
+                let first_bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx0])?;
+                if first_bin != 0 {
+                    cu_qp_delta_abs = 1;
+                    let ctx_idx1 = context::CU_QP_DELTA_ABS + 1;
+                    // Decode up to 4 more unary bins (max prefix = 5)
+                    for _ in 0..4 {
+                        #[cfg(feature = "trace-coefficients")]
+                        { self.cabac.trace_ctx_idx = ctx_idx1 as i32; }
+                        let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx1])?;
+                        if bin == 0 {
+                            break;
+                        }
+                        cu_qp_delta_abs += 1;
+                    }
+                    // If prefix == 5, decode exp-Golomb suffix (bypass)
+                    if cu_qp_delta_abs >= 5 {
+                        let mut k = 0u32;
+                        loop {
+                            let bin = self.cabac.decode_bypass()?;
+                            if bin == 0 {
+                                break;
+                            }
+                            k += 1;
+                        }
+                        let mut val = 0i32;
+                        for _ in 0..k {
+                            val = (val << 1) | self.cabac.decode_bypass()? as i32;
+                        }
+                        cu_qp_delta_abs += val + (1 << k) - 1;
+                    }
+                }
+                if cu_qp_delta_abs > 0 {
+                    // Decode sign flag (bypass)
+                    let sign = self.cabac.decode_bypass()?;
+                    self.cu_qp_delta = if sign != 0 { -cu_qp_delta_abs } else { cu_qp_delta_abs };
+                } else {
+                    self.cu_qp_delta = 0;
+                }
+                self.is_cu_qp_delta_coded = true;
+                if debug_tt {
+                    eprintln!("    TT: cu_qp_delta_abs={} delta={}", cu_qp_delta_abs, self.cu_qp_delta);
+                }
+            }
+        }
+
+        // Decode and apply luma residuals
         if cbf_luma {
             if debug_tt {
                 let (r, o) = self.cabac.get_state();
                 eprintln!("    TT(1144,120): decoding luma residual (r={},o={})", r, o);
             }
-            let scan_order = residual::get_scan_order(log2_size, intra_mode.as_u8(), 0);
+            // Use per-position intra mode for scan order (critical for NxN partitions
+            // where each sub-TU has a different intra prediction mode)
+            let actual_mode = self.get_intra_pred_mode(x0, y0);
+            let scan_order = residual::get_scan_order(log2_size, actual_mode.as_u8(), 0);
             self.decode_and_apply_residual(x0, y0, log2_size, 0, scan_order, frame)?;
             if debug_tt {
                 let (r, o) = self.cabac.get_state();
@@ -909,7 +1137,8 @@ impl<'a> SliceContext<'a> {
                     let (r, o) = self.cabac.get_state();
                     eprintln!("    TT(1144,120): decoding Cb residual (r={},o={})", r, o);
                 }
-                let scan_order = residual::get_scan_order(chroma_log2_size, intra_mode.as_u8(), 1);
+                let chroma_mode = self.get_intra_pred_mode_c(x0, y0);
+                let scan_order = residual::get_scan_order(chroma_log2_size, chroma_mode.as_u8(), 1);
                 self.decode_and_apply_residual(
                     x0 / 2,
                     y0 / 2,
@@ -928,7 +1157,8 @@ impl<'a> SliceContext<'a> {
                     let (r, o) = self.cabac.get_state();
                     eprintln!("    TT(1144,120): decoding Cr residual (r={},o={})", r, o);
                 }
-                let scan_order = residual::get_scan_order(chroma_log2_size, intra_mode.as_u8(), 2);
+                let chroma_mode = self.get_intra_pred_mode_c(x0, y0);
+                let scan_order = residual::get_scan_order(chroma_log2_size, chroma_mode.as_u8(), 2);
                 self.decode_and_apply_residual(
                     x0 / 2,
                     y0 / 2,
@@ -1222,6 +1452,8 @@ impl<'a> SliceContext<'a> {
         if pred_mode == PredMode::Intra {
             // For intra, first bin distinguishes 2Nx2N from NxN
             let ctx_idx = context::PART_MODE;
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = ctx_idx as i32; }
             let bin = self.cabac.decode_bin(&mut self.ctx[ctx_idx])?;
 
             if bin != 0 {
@@ -1251,6 +1483,10 @@ impl<'a> SliceContext<'a> {
     ) -> Result<IntraPredMode> {
         let (intra_luma_mode, intra_chroma_mode) =
             self.decode_intra_prediction_modes(x0, y0, log2_size, frame)?;
+
+        // Store chroma mode for scan order lookup in transform tree
+        let cb_size = 1u32 << log2_size;
+        self.set_intra_pred_mode_c(x0, y0, cb_size, intra_chroma_mode);
 
         // Apply luma intra prediction
         intra::predict_intra(frame, x0, y0, log2_size, intra_luma_mode, 0);
@@ -1285,6 +1521,8 @@ impl<'a> SliceContext<'a> {
     fn decode_intra_luma_mode(&mut self, x0: u32, y0: u32) -> Result<IntraPredMode> {
         // Decode prev_intra_luma_pred_flag
         let ctx_idx = context::PREV_INTRA_LUMA_PRED_FLAG;
+        #[cfg(feature = "trace-coefficients")]
+        { self.cabac.trace_ctx_idx = ctx_idx as i32; }
         let prev_intra_luma_pred_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
 
         self.decode_intra_mode_from_flag(prev_intra_luma_pred_flag, x0, y0)
@@ -1292,9 +1530,8 @@ impl<'a> SliceContext<'a> {
 
     /// Decode intra mode from a previously-decoded prev_intra_luma_pred_flag
     fn decode_intra_mode_from_flag(&mut self, prev_flag: bool, x0: u32, y0: u32) -> Result<IntraPredMode> {
-        // Get MPM candidates from neighbors (simplified - use defaults)
-        let cand_a = self.get_neighbor_intra_mode(x0.wrapping_sub(1), y0);
-        let cand_b = self.get_neighbor_intra_mode(x0, y0.wrapping_sub(1));
+        let cand_a = self.get_neighbor_intra_mode_left(x0, y0);
+        let cand_b = self.get_neighbor_intra_mode_above(x0, y0);
         let mpm = intra::fill_mpm_candidates(cand_a, cand_b);
 
         let intra_luma_mode = if prev_flag {
@@ -1304,8 +1541,8 @@ impl<'a> SliceContext<'a> {
         } else {
             // Decode rem_intra_luma_pred_mode (5 bits via bypass)
             let rem = self.decode_rem_intra_luma_pred_mode()?;
-            // Map through candidate list exclusion
-            self.map_rem_mode_to_intra(rem, &mpm)
+            let mode = self.map_rem_mode_to_intra(rem, &mpm);
+            mode
         };
 
         Ok(intra_luma_mode)
@@ -1317,6 +1554,8 @@ impl<'a> SliceContext<'a> {
     /// - If first bin is 1: read 2 fixed-length bypass bits → modes 0-3
     fn decode_intra_chroma_mode(&mut self, luma_mode: IntraPredMode) -> Result<IntraPredMode> {
         let ctx_idx = context::INTRA_CHROMA_PRED_MODE;
+        #[cfg(feature = "trace-coefficients")]
+        { self.cabac.trace_ctx_idx = ctx_idx as i32; }
         if self.cabac.decode_bin(&mut self.ctx[ctx_idx])? == 0 {
             // Mode 4: derived from luma
             return Ok(luma_mode);
@@ -1361,11 +1600,38 @@ impl<'a> SliceContext<'a> {
         Ok((intra_luma_mode, intra_chroma_mode))
     }
 
-    /// Get intra prediction mode of a neighbor (simplified)
-    fn get_neighbor_intra_mode(&self, _x: u32, _y: u32) -> IntraPredMode {
-        // For a proper implementation, we would store modes in a metadata array
-        // For now, return DC as a default (common case at picture boundaries)
-        IntraPredMode::Dc
+    /// Get intra prediction mode of a neighbor for MPM candidate derivation.
+    /// Per H.265 spec 8.4.2: unavailable neighbors → INTRA_DC.
+    /// Per H.265 spec 6.4.1 + libde265 intrapred.cc: above neighbor across CTB row → INTRA_DC.
+    fn get_neighbor_intra_mode(&self, x: u32, y: u32) -> IntraPredMode {
+        // Out-of-picture positions (wrapping_sub makes them huge)
+        if x >= self.sps.pic_width_in_luma_samples || y >= self.sps.pic_height_in_luma_samples {
+            return IntraPredMode::Dc;
+        }
+        self.get_intra_pred_mode(x, y)
+    }
+
+    /// Get intra prediction mode of the LEFT neighbor for position (x0, y0).
+    /// Checks picture boundaries only (left in same CTB row is always OK).
+    fn get_neighbor_intra_mode_left(&self, x0: u32, y0: u32) -> IntraPredMode {
+        self.get_neighbor_intra_mode(x0.wrapping_sub(1), y0)
+    }
+
+    /// Get intra prediction mode of the ABOVE neighbor for position (x0, y0).
+    /// Per H.265 spec: if the above position is in a different CTB row, return DC.
+    fn get_neighbor_intra_mode_above(&self, x0: u32, y0: u32) -> IntraPredMode {
+        let y_above = y0.wrapping_sub(1);
+        // Out-of-picture check
+        if y_above >= self.sps.pic_height_in_luma_samples {
+            return IntraPredMode::Dc;
+        }
+        // CTB row boundary check: if y-1 is above the current CTB's top edge
+        let ctb_size = self.sps.ctb_size();
+        let ctb_row_start = (y0 / ctb_size) * ctb_size;
+        if y_above < ctb_row_start {
+            return IntraPredMode::Dc;
+        }
+        self.get_intra_pred_mode(x0, y_above)
     }
 
     /// Map rem_intra_luma_pred_mode to actual mode (excluding MPM candidates)
