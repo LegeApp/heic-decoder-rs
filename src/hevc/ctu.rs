@@ -70,6 +70,11 @@ pub struct SliceContext<'a> {
     ct_depth_map: Vec<u8>,
     /// Width of ct_depth_map in min_cb_size units
     ct_depth_map_stride: u32,
+    /// Intra prediction mode map (indexed by 4x4 block grid)
+    /// Stores mode as u8, 0xFF means unavailable/not-yet-decoded
+    intra_mode_map: Vec<u8>,
+    /// Width of intra_mode_map in 4x4 units
+    intra_mode_map_stride: u32,
 }
 
 impl<'a> SliceContext<'a> {
@@ -144,6 +149,12 @@ impl<'a> SliceContext<'a> {
         let ct_depth_map_height = sps.pic_height_in_luma_samples.div_ceil(min_cb_size);
         let ct_depth_map = vec![0xFF; (ct_depth_map_stride * ct_depth_map_height) as usize];
 
+        // Initialize intra_mode_map for neighbor mode derivation
+        // Map is in 4x4 block units (smallest PU size)
+        let intra_mode_map_stride = sps.pic_width_in_luma_samples.div_ceil(4);
+        let intra_mode_map_height = sps.pic_height_in_luma_samples.div_ceil(4);
+        let intra_mode_map = vec![0xFF; (intra_mode_map_stride * intra_mode_map_height) as usize];
+
         Ok(Self {
             sps,
             pps,
@@ -162,6 +173,8 @@ impl<'a> SliceContext<'a> {
             chroma_pred_count: 0,
             ct_depth_map,
             ct_depth_map_stride,
+            intra_mode_map,
+            intra_mode_map_stride,
         })
     }
 
@@ -584,6 +597,12 @@ impl<'a> SliceContext<'a> {
                 let luma_mode_1 = self.decode_intra_mode_from_flag(prev_flag_1, x0 + half, y0)?;
                 let luma_mode_2 = self.decode_intra_mode_from_flag(prev_flag_2, x0, y0 + half)?;
                 let luma_mode_3 = self.decode_intra_mode_from_flag(prev_flag_3, x0 + half, y0 + half)?;
+
+                // Store modes in map for neighbor derivation
+                self.set_intra_mode(x0, y0, half, half, luma_mode_0);
+                self.set_intra_mode(x0 + half, y0, half, half, luma_mode_1);
+                self.set_intra_mode(x0, y0 + half, half, half, luma_mode_2);
+                self.set_intra_mode(x0 + half, y0 + half, half, half, luma_mode_3);
 
                 // Decode chroma mode once (using first luma mode for derivation if mode=4)
                 let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
@@ -1244,6 +1263,10 @@ impl<'a> SliceContext<'a> {
         let (intra_luma_mode, intra_chroma_mode) =
             self.decode_intra_prediction_modes(x0, y0, log2_size, frame)?;
 
+        // Store mode in map for neighbor derivation
+        let size = 1u32 << log2_size;
+        self.set_intra_mode(x0, y0, size, size, intra_luma_mode);
+
         // Apply luma intra prediction
         intra::predict_intra(frame, x0, y0, log2_size, intra_luma_mode, 0);
 
@@ -1353,11 +1376,47 @@ impl<'a> SliceContext<'a> {
         Ok((intra_luma_mode, intra_chroma_mode))
     }
 
-    /// Get intra prediction mode of a neighbor (simplified)
-    fn get_neighbor_intra_mode(&self, _x: u32, _y: u32) -> IntraPredMode {
-        // For a proper implementation, we would store modes in a metadata array
-        // For now, return DC as a default (common case at picture boundaries)
-        IntraPredMode::Dc
+    /// Store intra prediction mode in the map
+    fn set_intra_mode(&mut self, x: u32, y: u32, width: u32, height: u32, mode: IntraPredMode) {
+        // Map coordinates are in 4x4 block units
+        let block_x = x / 4;
+        let block_y = y / 4;
+        let block_w = width / 4;
+        let block_h = height / 4;
+        let mode_val = mode.as_u8();
+        
+        for by in 0..block_h {
+            for bx in 0..block_w {
+                let map_idx = ((block_y + by) * self.intra_mode_map_stride + (block_x + bx)) as usize;
+                if map_idx < self.intra_mode_map.len() {
+                    self.intra_mode_map[map_idx] = mode_val;
+                }
+            }
+        }
+    }
+
+    /// Get intra prediction mode of a neighbor
+    fn get_neighbor_intra_mode(&self, x: u32, y: u32) -> IntraPredMode {
+        // Map coordinates are in 4x4 block units
+        let block_x = x / 4;
+        let block_y = y / 4;
+        
+        // Check picture boundaries (neighbor outside picture)
+        if x >= self.sps.pic_width_in_luma_samples || y >= self.sps.pic_height_in_luma_samples {
+            return IntraPredMode::Dc;
+        }
+        
+        let map_idx = (block_y * self.intra_mode_map_stride + block_x) as usize;
+        if map_idx < self.intra_mode_map.len() {
+            let mode_val = self.intra_mode_map[map_idx];
+            if mode_val == 0xFF {
+                // Not available (not yet decoded or unavailable)
+                return IntraPredMode::Dc;
+            }
+            IntraPredMode::from_u8(mode_val).unwrap_or(IntraPredMode::Dc)
+        } else {
+            IntraPredMode::Dc
+        }
     }
 
     /// Map rem_intra_luma_pred_mode to actual mode (excluding MPM candidates)
