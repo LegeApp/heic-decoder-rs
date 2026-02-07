@@ -21,6 +21,69 @@ use crate::error::HevcError;
 
 type Result<T> = core::result::Result<T, HevcError>;
 
+/// SAO (Sample Adaptive Offset) type
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaoType {
+    /// SAO disabled for this component
+    None,
+    /// Band offset: offsets applied based on sample value bands
+    Band,
+    /// Edge offset: offsets applied based on edge direction
+    Edge,
+}
+
+/// Edge offset class (direction for edge comparison)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SaoEoClass {
+    Horizontal = 0,   // 0°
+    Vertical = 1,     // 90°
+    Diagonal135 = 2,  // 135°
+    Diagonal45 = 3,   // 45°
+}
+
+impl SaoEoClass {
+    fn from_bits(bits: u32) -> Self {
+        match bits {
+            0 => SaoEoClass::Horizontal,
+            1 => SaoEoClass::Vertical,
+            2 => SaoEoClass::Diagonal135,
+            _ => SaoEoClass::Diagonal45,
+        }
+    }
+}
+
+/// SAO parameters for a single component
+#[derive(Clone, Debug)]
+pub struct SaoComponentParams {
+    /// SAO type: None, Band, or Edge
+    pub sao_type: SaoType,
+    /// 4 offset values (can be positive or negative)
+    pub offsets: [i32; 4],
+    /// For band offset: starting band position (0-31)
+    pub band_position: u8,
+    /// For edge offset: edge class (direction)
+    pub eo_class: SaoEoClass,
+}
+
+impl Default for SaoComponentParams {
+    fn default() -> Self {
+        Self {
+            sao_type: SaoType::None,
+            offsets: [0; 4],
+            band_position: 0,
+            eo_class: SaoEoClass::Horizontal,
+        }
+    }
+}
+
+/// SAO parameters for a CTU (all 3 components)
+#[derive(Clone, Debug, Default)]
+pub struct SaoParams {
+    pub luma: SaoComponentParams,
+    pub cb: SaoComponentParams,
+    pub cr: SaoComponentParams,
+}
+
 /// Chroma QP mapping table (H.265 Table 8-10)
 /// Maps qPi (0-57) to QpC for 8-bit video
 fn chroma_qp_mapping(qp_i: i32) -> i32 {
@@ -83,6 +146,10 @@ pub struct SliceContext<'a> {
     wpp_saved_ctx: Vec<[ContextModel; context::NUM_CONTEXTS]>,
     /// Reconstruction map tracking which samples have been decoded (for intra prediction availability)
     reco_map: ReconstructionMap,
+    /// SAO parameters per CTU, indexed by (ctb_y * ctbs_per_row + ctb_x)
+    sao_params: Vec<SaoParams>,
+    /// Number of CTBs per row for SAO indexing
+    ctbs_per_row: u32,
 }
 
 impl<'a> SliceContext<'a> {
@@ -164,6 +231,12 @@ impl<'a> SliceContext<'a> {
         let intra_pred_mode_y = vec![0u8; (intra_pred_stride * intra_pred_height) as usize];
         let intra_pred_mode_c = vec![0u8; (intra_pred_stride * intra_pred_height) as usize];
 
+        // Initialize SAO parameters storage
+        let ctb_size = sps.ctb_size();
+        let ctbs_per_row = sps.pic_width_in_luma_samples.div_ceil(ctb_size);
+        let ctbs_per_col = sps.pic_height_in_luma_samples.div_ceil(ctb_size);
+        let sao_params = vec![SaoParams::default(); (ctbs_per_row * ctbs_per_col) as usize];
+
         Ok(Self {
             sps,
             pps,
@@ -191,6 +264,8 @@ impl<'a> SliceContext<'a> {
                 sps.pic_width_in_luma_samples,
                 sps.pic_height_in_luma_samples,
             ),
+            sao_params,
+            ctbs_per_row,
         })
     }
 
@@ -402,12 +477,25 @@ impl<'a> SliceContext<'a> {
         }
 
         // Decode the coding quadtree
-        self.decode_coding_quadtree(x_ctb, y_ctb, log2_ctb_size, 0, frame)
+        self.decode_coding_quadtree(x_ctb, y_ctb, log2_ctb_size, 0, frame)?;
+
+        // Apply SAO filtering after CTU reconstruction
+        if self.sps.sample_adaptive_offset_enabled_flag {
+            self.apply_sao(x_ctb, y_ctb, frame);
+        }
+
+        Ok(())
     }
 
     /// Decode SAO (Sample Adaptive Offset) parameters for a CTU
     /// Per H.265 7.3.8.3: sao_merge_left_flag/sao_merge_up_flag only present when neighbor exists
+    /// Note: x_ctb and y_ctb are in PIXEL coordinates (CTB position * CTB size)
     fn decode_sao(&mut self, x_ctb: u32, y_ctb: u32) -> Result<()> {
+        let ctb_size = self.sps.ctb_size();
+        let ctb_x_idx = x_ctb / ctb_size;
+        let ctb_y_idx = y_ctb / ctb_size;
+        let ctb_addr = (ctb_y_idx * self.ctbs_per_row + ctb_x_idx) as usize;
+
         #[cfg(feature = "trace-coefficients")]
         {
             let (r, o) = self.cabac.get_state();
@@ -416,7 +504,7 @@ impl<'a> SliceContext<'a> {
         }
 
         // sao_merge_left_flag only present if leftCtbInSliceSeg is available (x > 0)
-        let sao_merge_left_flag = if x_ctb > 0 {
+        let sao_merge_left_flag = if ctb_x_idx > 0 {
             #[cfg(feature = "trace-coefficients")]
             { self.cabac.trace_ctx_idx = context::SAO_MERGE_FLAG as i32; }
             self.cabac.decode_bin(&mut self.ctx[context::SAO_MERGE_FLAG])? != 0
@@ -424,98 +512,156 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        if !sao_merge_left_flag {
-            // sao_merge_up_flag only present if upCtbInSliceSeg is available (y > 0)
-            let sao_merge_up_flag = if y_ctb > 0 {
+        if sao_merge_left_flag {
+            // Copy SAO params from left CTU
+            let left_addr = (ctb_y_idx * self.ctbs_per_row + ctb_x_idx - 1) as usize;
+            self.sao_params[ctb_addr] = self.sao_params[left_addr].clone();
+            #[cfg(feature = "trace-coefficients")]
+            eprintln!("SAO: merge_left from CTU at ({},{})", ctb_x_idx - 1, ctb_y_idx);
+            return Ok(());
+        }
+
+        // sao_merge_up_flag only present if upCtbInSliceSeg is available (y > 0)
+        let sao_merge_up_flag = if ctb_y_idx > 0 {
+            #[cfg(feature = "trace-coefficients")]
+            { self.cabac.trace_ctx_idx = context::SAO_MERGE_FLAG as i32; }
+            self.cabac.decode_bin(&mut self.ctx[context::SAO_MERGE_FLAG])? != 0
+        } else {
+            false
+        };
+
+        if sao_merge_up_flag {
+            // Copy SAO params from upper CTU
+            let up_addr = ((ctb_y_idx - 1) * self.ctbs_per_row + ctb_x_idx) as usize;
+            self.sao_params[ctb_addr] = self.sao_params[up_addr].clone();
+            #[cfg(feature = "trace-coefficients")]
+            eprintln!("SAO: merge_up from CTU at ({},{})", ctb_x_idx, ctb_y_idx - 1);
+            return Ok(());
+        }
+
+        // Decode SAO parameters for this CTU
+        // Per H.265 Section 7.3.8.3:
+        // - sao_type_idx_luma decoded for c_idx=0
+        // - sao_type_idx_chroma decoded for c_idx=1
+        // - c_idx=2 (Cr) inherits type from c_idx=1 (Cb) — NOT decoded
+        // - sao_eo_class decoded only for c_idx < 2; c_idx=2 inherits from c_idx=1
+        // - sao_offset_abs decoded for all 3 components if type != 0
+        // - sao_offset_sign and sao_band_position only for band offset (type=1)
+        let mut sao_type = [SaoType::None; 3];
+        let mut offsets = [[0i32; 4]; 3];
+        let mut band_position = [0u8; 3];
+        let mut eo_class = [SaoEoClass::Horizontal; 3];
+
+        for c_idx in 0..3usize {
+            // Type index: only decoded for c_idx < 2
+            if c_idx < 2 {
                 #[cfg(feature = "trace-coefficients")]
-                { self.cabac.trace_ctx_idx = context::SAO_MERGE_FLAG as i32; }
-                self.cabac.decode_bin(&mut self.ctx[context::SAO_MERGE_FLAG])? != 0
+                { self.cabac.trace_ctx_idx = context::SAO_TYPE_IDX as i32; }
+                let first_bin = self.cabac.decode_bin(&mut self.ctx[context::SAO_TYPE_IDX])? != 0;
+
+                #[cfg(feature = "trace-coefficients")]
+                {
+                    let (r, o) = self.cabac.get_state();
+                    let (byte, _, _) = self.cabac.get_position();
+                    eprintln!("SAO: c_idx={} first_bin={} byte={} cabac=({},{})", c_idx, first_bin, byte, r, o);
+                }
+
+                if first_bin {
+                    let second_bin = self.cabac.decode_bypass()? != 0;
+                    // TR binarization cMax=2: value=1 → bins "10", value=2 → bins "11"
+                    // second_bin=0 → value=1 (band), second_bin=1 → value=2 (edge)
+                    sao_type[c_idx] = if second_bin { SaoType::Edge } else { SaoType::Band };
+
+                    #[cfg(feature = "trace-coefficients")]
+                    eprintln!("SAO: c_idx={} type={:?}", c_idx, sao_type[c_idx]);
+                }
             } else {
-                false
-            };
+                // c_idx=2: inherit type from c_idx=1
+                sao_type[2] = sao_type[1];
+                eo_class[2] = eo_class[1]; // Also inherit eo_class
 
-            if !sao_merge_up_flag {
-                // Per H.265 Section 7.3.8.3:
-                // - sao_type_idx_luma decoded for c_idx=0
-                // - sao_type_idx_chroma decoded for c_idx=1
-                // - c_idx=2 (Cr) inherits type from c_idx=1 (Cb) — NOT decoded
-                // - sao_eo_class decoded only for c_idx < 2; c_idx=2 inherits from c_idx=1
-                // - sao_offset_abs decoded for all 3 components if type != 0
-                // - sao_offset_sign and sao_band_position only for band offset (type=1)
-                let mut sao_type = [0u8; 3]; // 0=none, 1=band, 2=edge
+                #[cfg(feature = "trace-coefficients")]
+                eprintln!("SAO: c_idx=2 inherited type={:?} from c_idx=1", sao_type[2]);
+            }
 
-                for c_idx in 0..3u8 {
-                    // Type index: only decoded for c_idx < 2
-                    if c_idx < 2 {
-                        #[cfg(feature = "trace-coefficients")]
-                        { self.cabac.trace_ctx_idx = context::SAO_TYPE_IDX as i32; }
-                        let first_bin = self.cabac.decode_bin(&mut self.ctx[context::SAO_TYPE_IDX])? != 0;
-
-                        #[cfg(feature = "trace-coefficients")]
-                        {
-                            let (r, o) = self.cabac.get_state();
-                            let (byte, _, _) = self.cabac.get_position();
-                            eprintln!("SAO: c_idx={} first_bin={} byte={} cabac=({},{})", c_idx, first_bin, byte, r, o);
+            // Decode offsets if SAO is enabled for this component
+            if sao_type[c_idx] != SaoType::None {
+                // Decode 4 offset absolute values (unary bypass coding)
+                let mut offset_abs = [0u32; 4];
+                for i in 0..4 {
+                    let mut abs_val = 0u32;
+                    loop {
+                        let bin = self.cabac.decode_bypass()?;
+                        if bin == 0 {
+                            break;
                         }
-
-                        if first_bin {
-                            let second_bin = self.cabac.decode_bypass()? != 0;
-                            // TR binarization cMax=2: value=1 → bins "10", value=2 → bins "11"
-                            // second_bin=0 → value=1 (band), second_bin=1 → value=2 (edge)
-                            sao_type[c_idx as usize] = if second_bin { 2 } else { 1 };
-
-                            #[cfg(feature = "trace-coefficients")]
-                            eprintln!("SAO: c_idx={} type={} (1=band, 2=edge)", c_idx, sao_type[c_idx as usize]);
+                        abs_val += 1;
+                        if abs_val >= 31 {
+                            break;
                         }
-                    } else {
-                        // c_idx=2: inherit type from c_idx=1
-                        sao_type[2] = sao_type[1];
-
-                        #[cfg(feature = "trace-coefficients")]
-                        eprintln!("SAO: c_idx=2 inherited type={} from c_idx=1", sao_type[2]);
                     }
+                    offset_abs[i] = abs_val;
+                }
 
-                    // Decode offsets if SAO is enabled for this component
-                    if sao_type[c_idx as usize] != 0 {
-                        // Decode 4 offset absolute values (unary bypass coding)
-                        let mut offset_abs = [0u32; 4];
-                        for i in 0..4 {
-                            let mut abs_val = 0u32;
-                            loop {
-                                let bin = self.cabac.decode_bypass()?;
-                                if bin == 0 {
-                                    break;
-                                }
-                                abs_val += 1;
-                                if abs_val >= 31 {
-                                    break;
-                                }
-                            }
-                            offset_abs[i] = abs_val;
-                        }
-
-                        if sao_type[c_idx as usize] == 1 {
-                            // Band offset: decode signs for non-zero offsets, then band_position
-                            for i in 0..4 {
-                                if offset_abs[i] > 0 {
-                                    let _sign = self.cabac.decode_bypass()?;
-                                }
-                            }
-                            let _band_position = self.cabac.decode_bypass_bits(5)?;
+                if sao_type[c_idx] == SaoType::Band {
+                    // Band offset: decode signs for non-zero offsets, then band_position
+                    for i in 0..4 {
+                        if offset_abs[i] > 0 {
+                            let sign = self.cabac.decode_bypass()?;
+                            // sign=1 means negative
+                            offsets[c_idx][i] = if sign != 0 {
+                                -(offset_abs[i] as i32)
+                            } else {
+                                offset_abs[i] as i32
+                            };
                         } else {
-                            // Edge offset: decode eo_class only for c_idx < 2
-                            // (c_idx=2 inherits eo_class from c_idx=1)
-                            // No sign decoding for edge offset (signs derived from edge class)
-                            if c_idx < 2 {
-                                let _eo_class = self.cabac.decode_bypass_bits(2)?;
-                                #[cfg(feature = "trace-coefficients")]
-                                eprintln!("SAO: c_idx={} eo_class={}", c_idx, _eo_class);
-                            }
+                            offsets[c_idx][i] = 0;
                         }
+                    }
+                    band_position[c_idx] = self.cabac.decode_bypass_bits(5)? as u8;
+                } else {
+                    // Edge offset: signs are derived from edge category (Table 8-3)
+                    // Edge categories: 0=valley (+), 1=peak (+), 2=flat_below (-), 3=flat_above (-)
+                    // category 0, 1 → positive offset; category 2, 3 → negative offset
+                    // But we store as positive because sign is implicit based on category
+                    // Per H.265 8.7.3.2: SaoOffsetVal[i] = offset_abs[i] for category 0,1
+                    //                    SaoOffsetVal[i] = -offset_abs[i] for category 2,3
+                    // Store absolute values and let apply_sao handle sign based on category
+                    for i in 0..4 {
+                        offsets[c_idx][i] = offset_abs[i] as i32;
+                    }
+                    
+                    // decode eo_class only for c_idx < 2 (c_idx=2 inherits from c_idx=1)
+                    if c_idx < 2 {
+                        eo_class[c_idx] = SaoEoClass::from_bits(self.cabac.decode_bypass_bits(2)?);
+                        #[cfg(feature = "trace-coefficients")]
+                        eprintln!("SAO: c_idx={} eo_class={:?}", c_idx, eo_class[c_idx]);
                     }
                 }
             }
         }
+
+        // Store the decoded SAO parameters
+        self.sao_params[ctb_addr] = SaoParams {
+            luma: SaoComponentParams {
+                sao_type: sao_type[0],
+                offsets: offsets[0],
+                band_position: band_position[0],
+                eo_class: eo_class[0],
+            },
+            cb: SaoComponentParams {
+                sao_type: sao_type[1],
+                offsets: offsets[1],
+                band_position: band_position[1],
+                eo_class: eo_class[1],
+            },
+            cr: SaoComponentParams {
+                sao_type: sao_type[2],
+                offsets: offsets[2],
+                band_position: band_position[2],
+                eo_class: eo_class[2],
+            },
+        };
 
         #[cfg(feature = "trace-coefficients")]
         {
@@ -525,6 +671,210 @@ impl<'a> SliceContext<'a> {
         }
 
         Ok(())
+    }
+
+    /// Apply SAO (Sample Adaptive Offset) filtering to a CTU
+    /// Per H.265 Section 8.7.3
+    /// Note: x_ctb and y_ctb are in PIXEL coordinates (CTB position * CTB size)
+    fn apply_sao(&self, x_ctb: u32, y_ctb: u32, frame: &mut DecodedFrame) {
+        let ctb_size = self.sps.ctb_size();
+        let ctb_x_idx = x_ctb / ctb_size;
+        let ctb_y_idx = y_ctb / ctb_size;
+        let ctb_addr = (ctb_y_idx * self.ctbs_per_row + ctb_x_idx) as usize;
+        let params = &self.sao_params[ctb_addr];
+        let pic_width = self.sps.pic_width_in_luma_samples;
+        let pic_height = self.sps.pic_height_in_luma_samples;
+        
+        // Calculate CTU bounds in pixels (x_ctb/y_ctb already in pixels)
+        let x_start = x_ctb as i32;
+        let y_start = y_ctb as i32;
+        let x_end = (x_ctb + ctb_size).min(pic_width) as i32;
+        let y_end = (y_ctb + ctb_size).min(pic_height) as i32;
+        
+        // Apply SAO to luma
+        if params.luma.sao_type != SaoType::None {
+            self.apply_sao_component(
+                &params.luma,
+                x_start, y_start, x_end, y_end,
+                pic_width as i32, pic_height as i32,
+                0, // c_idx = 0 for luma
+                frame,
+            );
+        }
+        
+        // Apply SAO to chroma (subsampled coordinates for 4:2:0)
+        let chroma_x_start = x_start / 2;
+        let chroma_y_start = y_start / 2;
+        let chroma_x_end = x_end / 2;
+        let chroma_y_end = y_end / 2;
+        let chroma_pic_w = (pic_width / 2) as i32;
+        let chroma_pic_h = (pic_height / 2) as i32;
+        
+        if params.cb.sao_type != SaoType::None {
+            self.apply_sao_component(
+                &params.cb,
+                chroma_x_start, chroma_y_start, chroma_x_end, chroma_y_end,
+                chroma_pic_w, chroma_pic_h,
+                1, // c_idx = 1 for Cb
+                frame,
+            );
+        }
+        
+        if params.cr.sao_type != SaoType::None {
+            self.apply_sao_component(
+                &params.cr,
+                chroma_x_start, chroma_y_start, chroma_x_end, chroma_y_end,
+                chroma_pic_w, chroma_pic_h,
+                2, // c_idx = 2 for Cr
+                frame,
+            );
+        }
+    }
+    
+    /// Apply SAO to a single component
+    fn apply_sao_component(
+        &self,
+        params: &SaoComponentParams,
+        x_start: i32, y_start: i32, x_end: i32, y_end: i32,
+        pic_w: i32, pic_h: i32,
+        c_idx: u8,
+        frame: &mut DecodedFrame,
+    ) {
+        match params.sao_type {
+            SaoType::None => {},
+            SaoType::Band => {
+                self.apply_sao_band(params, x_start, y_start, x_end, y_end, c_idx, frame);
+            },
+            SaoType::Edge => {
+                self.apply_sao_edge(params, x_start, y_start, x_end, y_end, pic_w, pic_h, c_idx, frame);
+            },
+        }
+    }
+    
+    /// Apply band offset SAO
+    /// Per H.265 8.7.3.1: Band offset assigns samples to 32 bands based on value
+    fn apply_sao_band(
+        &self,
+        params: &SaoComponentParams,
+        x_start: i32, y_start: i32, x_end: i32, y_end: i32,
+        c_idx: u8,
+        frame: &mut DecodedFrame,
+    ) {
+        let band_shift = self.sps.bit_depth_y() - 5; // For 8-bit: shift by 3 to get band (0-31)
+        let band_pos = params.band_position as i32;
+        
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let sample = match c_idx {
+                    0 => frame.get_y(x as u32, y as u32) as i32,
+                    1 => frame.get_cb(x as u32, y as u32) as i32,
+                    _ => frame.get_cr(x as u32, y as u32) as i32,
+                };
+                
+                // Determine band index
+                let band = sample >> band_shift;
+                
+                // Check if band is in the 4 activated bands starting at band_position
+                // The 4 activated bands are: band_pos, band_pos+1, band_pos+2, band_pos+3
+                let relative_band = band - band_pos;
+                if relative_band >= 0 && relative_band < 4 {
+                    let offset = params.offsets[relative_band as usize];
+                    let new_sample = (sample + offset).clamp(0, 255) as u16;
+                    match c_idx {
+                        0 => frame.set_y(x as u32, y as u32, new_sample),
+                        1 => frame.set_cb(x as u32, y as u32, new_sample),
+                        _ => frame.set_cr(x as u32, y as u32, new_sample),
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Apply edge offset SAO
+    /// Per H.265 8.7.3.2: Edge offset compares sample to neighbors
+    fn apply_sao_edge(
+        &self,
+        params: &SaoComponentParams,
+        x_start: i32, y_start: i32, x_end: i32, y_end: i32,
+        pic_w: i32, pic_h: i32,
+        c_idx: u8,
+        frame: &mut DecodedFrame,
+    ) {
+        // Edge offset direction patterns (dx1, dy1, dx2, dy2)
+        // eo_class 0: horizontal (90°)  - compare to left and right
+        // eo_class 1: vertical (0°)     - compare to top and bottom
+        // eo_class 2: 135° diagonal     - compare to top-left and bottom-right
+        // eo_class 3: 45° diagonal      - compare to top-right and bottom-left
+        let (dx1, dy1, dx2, dy2) = match params.eo_class {
+            SaoEoClass::Horizontal => (-1, 0, 1, 0),
+            SaoEoClass::Vertical   => (0, -1, 0, 1),
+            SaoEoClass::Diagonal135 => (-1, -1, 1, 1),
+            SaoEoClass::Diagonal45  => (1, -1, -1, 1),
+        };
+        
+        // Edge category to offset index mapping per H.265 Table 8-3
+        // Category 0: sample < both neighbors   → offset[0] (positive)
+        // Category 1: sample < one neighbor, = other → offset[1] (positive)
+        // Category 2: sample = both neighbors   → no offset
+        // Category 3: sample > one neighbor, = other → offset[2] (negative)
+        // Category 4: sample > both neighbors   → offset[3] (negative)
+        
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                // Get neighbor positions
+                let x1 = x + dx1;
+                let y1 = y + dy1;
+                let x2 = x + dx2;
+                let y2 = y + dy2;
+                
+                // Skip if neighbors are outside picture bounds
+                if x1 < 0 || x1 >= pic_w || y1 < 0 || y1 >= pic_h ||
+                   x2 < 0 || x2 >= pic_w || y2 < 0 || y2 >= pic_h {
+                    continue;
+                }
+                
+                let sample = match c_idx {
+                    0 => frame.get_y(x as u32, y as u32) as i32,
+                    1 => frame.get_cb(x as u32, y as u32) as i32,
+                    _ => frame.get_cr(x as u32, y as u32) as i32,
+                };
+                
+                let neighbor1 = match c_idx {
+                    0 => frame.get_y(x1 as u32, y1 as u32) as i32,
+                    1 => frame.get_cb(x1 as u32, y1 as u32) as i32,
+                    _ => frame.get_cr(x1 as u32, y1 as u32) as i32,
+                };
+                
+                let neighbor2 = match c_idx {
+                    0 => frame.get_y(x2 as u32, y2 as u32) as i32,
+                    1 => frame.get_cb(x2 as u32, y2 as u32) as i32,
+                    _ => frame.get_cr(x2 as u32, y2 as u32) as i32,
+                };
+                
+                // Compute comparison values
+                let c1 = if sample < neighbor1 { -1 } else if sample > neighbor1 { 1 } else { 0 };
+                let c2 = if sample < neighbor2 { -1 } else if sample > neighbor2 { 1 } else { 0 };
+                let edge_idx = 2 + c1 + c2; // Results in 0-4
+                
+                // Apply offset based on edge category
+                let offset = match edge_idx {
+                    0 => params.offsets[0],  // Valley: both neighbors higher
+                    1 => params.offsets[1],  // Half valley
+                    2 => 0,                   // Flat
+                    3 => -params.offsets[2], // Half peak (negative offset)
+                    _ => -params.offsets[3], // Peak: both neighbors lower (negative)
+                };
+                
+                if offset != 0 {
+                    let new_sample = (sample + offset).clamp(0, 255) as u16;
+                    match c_idx {
+                        0 => frame.set_y(x as u32, y as u32, new_sample),
+                        1 => frame.set_cb(x as u32, y as u32, new_sample),
+                        _ => frame.set_cr(x as u32, y as u32, new_sample),
+                    }
+                }
+            }
+        }
     }
 
     /// Decode coding quadtree recursively
