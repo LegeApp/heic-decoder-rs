@@ -401,7 +401,6 @@ impl SliceHeader {
                         offsets.push(offset);
                     }
                 }
-                eprintln!("DEBUG: Parsed {} entry point offsets: {:?}", n, offsets);
                 (n, offsets)
             } else {
                 (0, Vec::new())
@@ -421,21 +420,6 @@ impl SliceHeader {
 
         // Get the byte offset where slice data begins
         let data_offset = reader.byte_position();
-
-        // DEBUG: Print slice header parsing info
-        eprintln!(
-            "DEBUG: Slice header: alignment_bit={}, data_offset={}",
-            alignment_bit, data_offset
-        );
-        eprintln!(
-            "DEBUG: slice_qp_delta={}, slice_qp_y={}, sao_luma={}, sao_chroma={}, wpp={}, entry_points={}",
-            slice_qp_delta,
-            26 + pps.init_qp_minus26 as i32 + slice_qp_delta as i32,
-            slice_sao_luma_flag,
-            slice_sao_chroma_flag,
-            pps.entropy_coding_sync_enabled_flag,
-            num_entry_point_offsets,
-        );
 
         // Calculate derived values
         let slice_qp_y = 26 + pps.init_qp_minus26 as i32 + slice_qp_delta as i32;

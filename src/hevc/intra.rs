@@ -167,85 +167,15 @@ pub fn predict_intra(
     fill_border_samples(frame, x, y, size, c_idx, &mut border, border_center, reco_map);
 
     // Apply reference sample filtering (H.265 8.4.4.2.3) BEFORE prediction
-    filter_reference_samples(
-        &mut border,
-        border_center,
-        size,
-        mode,
-        c_idx,
-        strong_intra_smoothing_enabled,
-        frame.bit_depth as u8,
-    );
-
-    // DEBUG: Trace Cb prediction at error position (32,16)
-    if c_idx == 1 && x == 32 && y == 16 {
-        let left_samples: Vec<i32> = (0..size.min(8) as usize)
-            .map(|i| border[border_center - 1 - i])
-            .collect();
-        let top_samples: Vec<i32> = (0..size.min(8) as usize)
-            .map(|i| border[border_center + 1 + i])
-            .collect();
-        let top_left = border[border_center];
-        eprintln!("ERROR_TRACE Cb(32,16) predict: size={} mode={:?}", size, mode);
-        eprintln!("  border: top_left={} left={:?} top={:?}", top_left, left_samples, top_samples);
-        // Compute DC average manually
-        let dc_avg: i32 = (left_samples.iter().take(size as usize).sum::<i32>() 
-                          + top_samples.iter().take(size as usize).sum::<i32>() 
-                          + size as i32) / (2 * size as i32);
-        eprintln!("  DC avg (if mode=DC) = {}", dc_avg);
-        // Check what's in frame before prediction
-        let frame_val = frame.get_cb(32, 16);
-        let left_neighbor = if x > 0 { frame.get_cb(x - 1, y) } else { 0 };
-        let top_neighbor = if y > 0 { frame.get_cb(x, y - 1) } else { 0 };
-        eprintln!("  frame_before_pred: Cb(32,16)={} left_neighbor={} top_neighbor={}", 
-            frame_val, left_neighbor, top_neighbor);
-    }
-
-    // DEBUG: Track order and print border samples for chroma blocks near the problem area
-    static PRED_SEQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let debug_output = c_idx == 1 && y == 0 && (16..=36).contains(&x);
-    let seq = if debug_output {
-        PRED_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-    } else {
-        0
-    };
-
-    // Print BEFORE prediction to see what border samples are read
-    if c_idx == 1 && y == 0 && (20..=28).contains(&x) {
-        let left_samples: Vec<i32> = (0..size as usize)
-            .map(|i| border[border_center - 1 - i])
-            .collect();
-        let actual_frame_val = frame.get_cb(x.saturating_sub(1), y);
-        eprintln!(
-            "DEBUG Cb[{}]: at ({},{}) BEFORE predict: border_left[0]={} frame.get_cb({},0)={}",
-            seq,
-            x,
-            y,
-            left_samples[0],
-            x.saturating_sub(1),
-            actual_frame_val
-        );
-    }
-
-    // DEBUG: Print detailed info for Cr around the corruption point (x=104-112)
-    if c_idx == 2 && y == 0 && (100..=116).contains(&x) {
-        let left_samples: Vec<i32> = (0..size.min(8) as usize)
-            .map(|i| border[border_center - 1 - i])
-            .collect();
-        let top_samples: Vec<i32> = (0..size.min(8) as usize)
-            .map(|i| border[border_center + 1 + i])
-            .collect();
-        let top_left = border[border_center];
-        let left_frame_val = if x > 0 { frame.get_cr(x - 1, 0) } else { 0 };
-        eprintln!("DEBUG Cr: at ({},{}) size={} mode={:?}", x, y, size, mode);
-        eprintln!(
-            "  border: top_left={} left={:?} top={:?}",
-            top_left, left_samples, top_samples
-        );
-        eprintln!(
-            "  frame.get_cr({},0)={}",
-            x.saturating_sub(1),
-            left_frame_val
+    if !std::env::var("HEVC_NO_REF_FILTER").is_ok() {
+        filter_reference_samples(
+            &mut border,
+            border_center,
+            size,
+            mode,
+            c_idx,
+            strong_intra_smoothing_enabled,
+            frame.bit_depth as u8,
         );
     }
 
@@ -263,28 +193,6 @@ pub fn predict_intra(
         }
     }
 
-    // DEBUG: Print predicted values for first block
-    if x == 0 && y == 0 && c_idx == 0 {
-        eprintln!("DEBUG: predicted Y values at (0,0):");
-        for py in 0..size.min(4) {
-            let row: Vec<u16> = (0..size.min(4))
-                .map(|px| frame.get_y(x + px, y + py))
-                .collect();
-            eprintln!("  {:?}", row);
-        }
-    }
-
-    // DEBUG: Print Cb output after prediction for problem area
-    if debug_output {
-        // Print the right edge of the block (which will be read by the next block)
-        let right_edge: Vec<u16> = (0..size)
-            .map(|py| frame.get_cb(x + size - 1, y + py))
-            .collect();
-        eprintln!(
-            "DEBUG Cb: predicted at ({},{}) size={} mode={:?} right_edge={:?}",
-            x, y, size, mode, right_edge
-        );
-    }
 }
 
 /// Fill border samples from neighboring pixels using z-scan availability (H.265 8.4.4.2.1)

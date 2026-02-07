@@ -470,8 +470,8 @@ pub fn parse_pps(data: &[u8]) -> Result<Pps> {
     let init_qp_minus26 = reader.read_se()? as i8;
     let constrained_intra_pred_flag = reader.read_bit()? != 0;
     let transform_skip_enabled_flag = reader.read_bit()? != 0;
-
     let cu_qp_delta_enabled_flag = reader.read_bit()? != 0;
+
     let diff_cu_qp_delta_depth = if cu_qp_delta_enabled_flag {
         reader.read_ue()? as u8
     } else {

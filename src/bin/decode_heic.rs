@@ -50,7 +50,8 @@ fn main() {
             for y in frame.crop_top..(frame.height - frame.crop_bottom) {
                 for x in frame.crop_left..(frame.width - frame.crop_right) {
                     let idx = (y * frame.width + x) as usize;
-                    yuv.push((frame.y_plane[idx] >> shift) as u8);
+                    let val = (frame.y_plane[idx] >> shift) as u8;
+                    yuv.push(val);
                 }
             }
             // Cb plane (cropped, half resolution for 4:2:0)

@@ -277,7 +277,7 @@ pub fn idct32(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_depth: u8) {
     let shift1 = 7;
     let shift2 = 20 - bit_depth;
     let add1 = 1 << (shift1 - 1);
-    let add2 = 1 << (shift2 - 1);
+    let add2 = 1i64 << (shift2 - 1);
 
     let mut tmp = [0i32; 1024];
 
@@ -286,17 +286,18 @@ pub fn idct32(coeffs: &[i16; 1024], output: &mut [i16; 1024], bit_depth: u8) {
         partial_butterfly_inverse_32(&coeffs[i..], 32, &mut tmp[i..], 32, shift1, add1);
     }
 
-    // Second pass (horizontal)
+    // Second pass (horizontal) - use i32 intermediates directly (NOT i16!)
+    // First pass output can exceed i16 range (up to ~737k), so truncating to i16
+    // would corrupt the transform result.
     for i in 0..32 {
         let row_start = i * 32;
-        let mut row_in = [0i16; 32];
-        let mut row_out = [0i32; 32];
         for j in 0..32 {
-            row_in[j] = tmp[row_start + j] as i16;
-        }
-        partial_butterfly_inverse_32_row(&row_in, &mut row_out, shift2 as i32, add2);
-        for j in 0..32 {
-            output[row_start + j] = row_out[j] as i16;
+            let mut sum = 0i64;
+            for k in 0..32 {
+                let coef = get_dct32_coef(k, j);
+                sum += coef as i64 * tmp[row_start + k] as i64;
+            }
+            output[row_start + j] = ((sum + add2) >> shift2) as i16;
         }
     }
 }
