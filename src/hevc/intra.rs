@@ -61,6 +61,30 @@ pub fn predict_intra(
 
     fill_border_samples(frame, x, y, size, c_idx, &mut border, border_center, reco_map);
 
+    // DEBUG: Trace Cb prediction at error position (32,16)
+    if c_idx == 1 && x == 32 && y == 16 {
+        let left_samples: Vec<i32> = (0..size.min(8) as usize)
+            .map(|i| border[border_center - 1 - i])
+            .collect();
+        let top_samples: Vec<i32> = (0..size.min(8) as usize)
+            .map(|i| border[border_center + 1 + i])
+            .collect();
+        let top_left = border[border_center];
+        eprintln!("ERROR_TRACE Cb(32,16) predict: size={} mode={:?}", size, mode);
+        eprintln!("  border: top_left={} left={:?} top={:?}", top_left, left_samples, top_samples);
+        // Compute DC average manually
+        let dc_avg: i32 = (left_samples.iter().take(size as usize).sum::<i32>() 
+                          + top_samples.iter().take(size as usize).sum::<i32>() 
+                          + size as i32) / (2 * size as i32);
+        eprintln!("  DC avg (if mode=DC) = {}", dc_avg);
+        // Check what's in frame before prediction
+        let frame_val = frame.get_cb(32, 16);
+        let left_neighbor = if x > 0 { frame.get_cb(x - 1, y) } else { 0 };
+        let top_neighbor = if y > 0 { frame.get_cb(x, y - 1) } else { 0 };
+        eprintln!("  frame_before_pred: Cb(32,16)={} left_neighbor={} top_neighbor={}", 
+            frame_val, left_neighbor, top_neighbor);
+    }
+
     // Apply prediction based on mode
     match mode {
         IntraPredMode::Planar => {

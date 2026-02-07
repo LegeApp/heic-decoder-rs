@@ -456,6 +456,12 @@ impl<'a> SliceContext<'a> {
     fn decode_ctu(&mut self, x_ctb: u32, y_ctb: u32, frame: &mut DecodedFrame) -> Result<()> {
         let log2_ctb_size = self.sps.log2_ctb_size();
 
+        // DEBUG: Print qp_y at CTU start
+        let ctb_x_idx = x_ctb / self.sps.ctb_size();
+        let ctb_y_idx = y_ctb / self.sps.ctb_size();
+        eprintln!("QP_TRACE: CTU({},{}) start: qp_y={} qp_cb={}", 
+            ctb_x_idx, ctb_y_idx, self.qp_y, self.qp_cb);
+
         // Reset per-CTU state
         if self.pps.cu_qp_delta_enabled_flag {
             self.is_cu_qp_delta_coded = false;
@@ -932,6 +938,8 @@ impl<'a> SliceContext<'a> {
         if self.pps.cu_qp_delta_enabled_flag
             && log2_cb_size >= self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth
         {
+            eprintln!("QP_TRACE: is_cu_qp_delta_coded reset at CU({},{}) log2={} qp_y={} qp_cb={}",
+                x0, y0, log2_cb_size, self.qp_y, self.qp_cb);
             self.is_cu_qp_delta_coded = false;
             self.cu_qp_delta = 0;
         }
@@ -1412,8 +1420,8 @@ impl<'a> SliceContext<'a> {
             // For 4:2:0, if we split from 8x8 to 4x4, decode chroma residuals now
             // (because 4x4 children can't have chroma TUs)
             if log2_size == 3 {
-                eprintln!("DEBUG: 8x8→4x4 split complete, decoding chroma at luma({},{}) → chroma({},{})",
-                    x0, y0, x0/2, y0/2);
+                eprintln!("DEBUG: 8x8→4x4 split complete, decoding chroma at luma({},{}) → chroma({},{}) qp_y={} qp_cb={}",
+                    x0, y0, x0/2, y0/2, self.qp_y, self.qp_cb);
 
                 // Apply chroma prediction for the deferred chroma TU before adding residuals
                 let chroma_mode = self.get_intra_pred_mode_c(x0, y0);
@@ -1515,6 +1523,9 @@ impl<'a> SliceContext<'a> {
             // H.265 spec 7.3.8.11: Decode cu_qp_delta_abs BEFORE residual data
             // when cu_qp_delta_enabled_flag is set and not yet coded for this CU
             if self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
+                let (byte, _, _) = self.cabac.get_position();
+                eprintln!("QP_TRACE: decoding cu_qp_delta at TU({},{}) log2={} before_qp_y={} byte={}",
+                    x0, y0, log2_size, self.qp_y, byte);
                 // cu_qp_delta_abs: TU(5) binarization with context-coded prefix
                 // First bin: CU_QP_DELTA_ABS + 0, subsequent bins: CU_QP_DELTA_ABS + 1
                 let mut cu_qp_delta_abs: i32 = 0;
@@ -1575,6 +1586,10 @@ impl<'a> SliceContext<'a> {
                     + self.header.slice_cr_qp_offset as i32;
                 self.qp_cb = chroma_qp_mapping(qp_i_cb.clamp(0, 57));
                 self.qp_cr = chroma_qp_mapping(qp_i_cr.clamp(0, 57));
+
+                // DEBUG: Always trace cu_qp_delta application
+                eprintln!("QP_TRACE: cu_qp_delta applied at TU({},{}) abs={} delta={} -> qp_y={} qp_cb={}",
+                    x0, y0, cu_qp_delta_abs, self.cu_qp_delta, self.qp_y, self.qp_cb);
 
                 if debug_tt {
                     eprintln!("    TT: cu_qp_delta_abs={} delta={} -> qp_y={} qp_cb={} qp_cr={}",
@@ -1722,6 +1737,14 @@ impl<'a> SliceContext<'a> {
         scan_order: ScanOrder,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
+        // DEBUG: Trace qp_cb at error position
+        if x0 == 32 && y0 == 16 && c_idx == 1 {
+            eprintln!(
+                "QP_DEBUG: decode_and_apply_residual Cb at (32,16): qp_y={} qp_cb={} qp_cr={}",
+                self.qp_y, self.qp_cb, self.qp_cr
+            );
+        }
+
         // Track chroma decode statistics
         static CB_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         static CR_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1745,6 +1768,11 @@ impl<'a> SliceContext<'a> {
 
         if coeff_buf.is_zero() {
             return Ok(());
+        }
+
+        // DEBUG: Cb(32,16) coefficients
+        if x0 == 32 && y0 == 16 && c_idx == 1 {
+            eprintln!("  Coefficients before dequant: {:?}", &coeff_buf.coeffs[..16]);
         }
 
         // DEBUG: Print first few coefficient blocks
@@ -1800,6 +1828,12 @@ impl<'a> SliceContext<'a> {
         };
         transform::dequantize(&mut coeffs[..num_coeffs], dequant_params);
 
+        // DEBUG: Cb(32,16) after dequant
+        if x0 == 32 && y0 == 16 && c_idx == 1 {
+            eprintln!("  After dequant (qp={} bit_depth={} log2={}):", qp, bit_depth, log2_size);
+            eprintln!("    {:?}", &coeffs[..16]);
+        }
+
         // DEBUG: Print dequantized coefficients for first block
         if x0 == 0 && y0 == 0 && c_idx == 0 {
             eprintln!("DEBUG: QP={}, bit_depth={}", self.qp_y, bit_depth);
@@ -1838,6 +1872,12 @@ impl<'a> SliceContext<'a> {
                 let row: Vec<i16> = (0..size.min(4)).map(|x| residual[y * size + x]).collect();
                 eprintln!("  {:?}", row);
             }
+        }
+
+        // DEBUG: Cb(32,16) after IDCT
+        if x0 == 32 && y0 == 16 && c_idx == 1 {
+            eprintln!("  After IDCT (is_intra_4x4_luma={}):", is_intra_4x4_luma);
+            eprintln!("    residual[0..16]: {:?}", &residual[..16]);
         }
 
         // DEBUG: Print residuals for Cb/Cr at CTU 1 boundary
@@ -1940,6 +1980,14 @@ impl<'a> SliceContext<'a> {
                     eprintln!(
                         "DEBUG: residual set_cr({},{}) = {} (pred={} r={})",
                         x, y, recon, pred, r
+                    );
+                }
+
+                // DEBUG: Track Cb writes at error boundary (32,16)
+                if c_idx == 1 && x == 32 && y == 16 {
+                    eprintln!(
+                        "ERROR_TRACE: Cb(32,16) = {} (pred={} r={}) qp={} qp_y={} pps_cb_offset={} slice_cb_offset={} from TU at ({},{})",
+                        recon, pred, r, qp, self.qp_y, self.pps.pps_cb_qp_offset, self.header.slice_cb_qp_offset, x0, y0
                     );
                 }
 
