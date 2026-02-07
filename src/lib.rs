@@ -80,13 +80,28 @@ impl HeicDecoder {
         // Find primary image item
         let primary_item = container.primary_item().ok_or(HeicError::NoPrimaryImage)?;
 
+        // Workaround for grid images: decode the first tile instead
+        // TODO: implement proper grid decoding with tile stitching
+        let item = if primary_item.item_type == heif::ItemType::Grid {
+            // Find the first HEVC tile item (usually item_id=1)
+            let tile_info = container.item_infos.iter()
+                .find(|info| {
+                    let item_type: heif::ItemType = info.item_type.into();
+                    item_type == heif::ItemType::Hvc1
+                })
+                .ok_or(HeicError::InvalidData("Grid has no tile items"))?;
+            container.get_item(tile_info.item_id).ok_or(HeicError::InvalidData("Tile item not found"))?
+        } else {
+            primary_item
+        };
+
         // Get image data
         let image_data = container
-            .get_item_data(primary_item.id)
+            .get_item_data(item.id)
             .ok_or(HeicError::InvalidData("Missing image data"))?;
 
         // Decode HEVC using config if available
-        let frame = if let Some(ref config) = primary_item.hevc_config {
+        let frame = if let Some(ref config) = item.hevc_config {
             hevc::decode_with_config(config, image_data)?
         } else {
             // Fallback to raw decode (Annex B or self-contained)
@@ -109,11 +124,28 @@ impl HeicDecoder {
     pub fn decode_to_frame(&self, data: &[u8]) -> Result<hevc::DecodedFrame> {
         let container = heif::parse(data)?;
         let primary_item = container.primary_item().ok_or(HeicError::NoPrimaryImage)?;
+        
+        // Workaround for grid images: decode the first tile instead
+        // TODO: implement proper grid decoding with tile stitching
+        let (item_id, item_type) = if primary_item.item_type == heif::ItemType::Grid {
+            // Find the first HEVC tile item (usually item_id=1)
+            let tile_item = container.item_infos.iter()
+                .find(|info| {
+                    let item_type: heif::ItemType = info.item_type.into();
+                    item_type == heif::ItemType::Hvc1
+                })
+                .ok_or(HeicError::InvalidData("Grid has no tile items"))?;
+            (tile_item.item_id, heif::ItemType::Hvc1)
+        } else {
+            (primary_item.id, primary_item.item_type)
+        };
+        
+        let item = container.get_item(item_id).ok_or(HeicError::InvalidData("Item not found"))?;
         let image_data = container
-            .get_item_data(primary_item.id)
+            .get_item_data(item.id)
             .ok_or(HeicError::InvalidData("Missing image data"))?;
 
-        if let Some(ref config) = primary_item.hevc_config {
+        if let Some(ref config) = item.hevc_config {
             Ok(hevc::decode_with_config(config, image_data)?)
         } else {
             Ok(hevc::decode(image_data)?)
