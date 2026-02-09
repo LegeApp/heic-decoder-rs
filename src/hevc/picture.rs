@@ -102,11 +102,13 @@ impl DecodedFrame {
     }
 
     /// Get luma stride (width)
+    #[inline]
     pub fn y_stride(&self) -> usize {
         self.width as usize
     }
 
     /// Get chroma stride
+    #[inline]
     pub fn c_stride(&self) -> usize {
         match self.chroma_format {
             0 => 0,

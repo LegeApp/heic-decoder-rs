@@ -35,6 +35,7 @@ pub static INV_ANGLE: [i32; 15] = [
 ];
 
 /// Get inverse angle for a mode (for negative angle modes only)
+#[inline]
 fn get_inv_angle(mode: u8) -> i32 {
     if (11..=25).contains(&mode) {
         INV_ANGLE[(mode - 11) as usize]
@@ -338,6 +339,7 @@ fn reference_sample_substitution(border: &mut [i32], center: usize, size: usize)
 }
 
 /// Get a sample from the frame
+#[inline]
 fn get_sample(frame: &DecodedFrame, x: u32, y: u32, c_idx: u8) -> u16 {
     match c_idx {
         0 => frame.get_y(x, y),
@@ -348,6 +350,7 @@ fn get_sample(frame: &DecodedFrame, x: u32, y: u32, c_idx: u8) -> u16 {
 }
 
 /// Set a sample in the frame
+#[inline]
 fn set_sample(frame: &mut DecodedFrame, x: u32, y: u32, c_idx: u8, value: u16) {
     match c_idx {
         0 => frame.set_y(x, y, value),

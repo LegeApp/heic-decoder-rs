@@ -87,6 +87,7 @@ pub struct SaoParams {
 
 /// Chroma QP mapping table (H.265 Table 8-10)
 /// Maps qPi (0-57) to QpC for 8-bit video
+#[inline]
 fn chroma_qp_mapping(qp_i: i32) -> i32 {
     // Table 8-10: qPi to QpC mapping
     // For qPi 0-29, QpC = qPi
