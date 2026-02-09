@@ -38,7 +38,7 @@ static DCT8_MATRIX: [[i16; 8]; 8] = [
 ];
 
 /// DCT-II basis functions for 16x16 (scaled by 64)
-static DCT16_MATRIX: [[i16; 16]; 16] = [
+pub(crate) static DCT16_MATRIX: [[i16; 16]; 16] = [
     [
         64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
     ],
@@ -90,10 +90,10 @@ static DCT16_MATRIX: [[i16; 16]; 16] = [
 ];
 
 /// DCT-II basis functions for 32x32 (first 16 rows shown, rest follow pattern)
-static DCT32_EVEN: [i16; 16] = [
+pub(crate) static DCT32_EVEN: [i16; 16] = [
     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
 ];
-static DCT32_ODD: [[i16; 16]; 16] = [
+pub(crate) static DCT32_ODD: [[i16; 16]; 16] = [
     [
         90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4,
     ],
@@ -335,7 +335,7 @@ fn partial_butterfly_inverse_32_row(src: &[i16; 32], dst: &mut [i32; 32], shift:
 }
 
 /// Get DCT32 coefficient at position (row, col)
-fn get_dct32_coef(row: usize, col: usize) -> i16 {
+pub(crate) fn get_dct32_coef(row: usize, col: usize) -> i16 {
     if row.is_multiple_of(2) {
         // Even rows: symmetric
         if row == 0 {
@@ -436,7 +436,8 @@ pub fn inverse_transform(
             let mut in_arr = [0i16; 1024];
             let mut out_arr = [0i16; 1024];
             in_arr[..coeffs.len().min(1024)].copy_from_slice(&coeffs[..coeffs.len().min(1024)]);
-            idct32(&in_arr, &mut out_arr, bit_depth);
+            // Use SIMD-optimized version for 32x32
+            super::transform_simd::idct32_optimized(&in_arr, &mut out_arr, bit_depth);
             output[..1024].copy_from_slice(&out_arr);
         }
         _ => {}

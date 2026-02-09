@@ -15,7 +15,8 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+// Allow unsafe code only when unsafe-simd feature is enabled for SIMD optimizations
+#![cfg_attr(not(feature = "unsafe-simd"), forbid(unsafe_code))]
 #![warn(missing_docs)]
 // Allow dead code during development - will be removed when decoder is complete
 #![allow(dead_code)]

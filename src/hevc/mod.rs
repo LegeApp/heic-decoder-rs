@@ -15,6 +15,7 @@ mod picture;
 mod residual;
 pub mod slice;
 mod transform;
+mod transform_simd;
 
 pub use picture::DecodedFrame;
 
